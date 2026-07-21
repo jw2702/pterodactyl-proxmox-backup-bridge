@@ -45,7 +45,7 @@ In Panel's `.env` (or the S3 backup disk settings in the admin UI), point
 the S3 client at the bridge:
 
 ```
-BACKUP_DRIVER=s3
+APP_BACKUP_DRIVER=s3
 AWS_DEFAULT_REGION=us-east-1        # must match BRIDGE_REGION below
 AWS_ACCESS_KEY_ID=<BRIDGE_ACCESS_KEY>
 AWS_SECRET_ACCESS_KEY=<BRIDGE_SECRET_KEY>
@@ -57,6 +57,42 @@ AWS_USE_PATH_STYLE_ENDPOINT=true    # required — the bridge only implements pa
 `AWS_USE_PATH_STYLE_ENDPOINT=true` is required: the bridge routes purely by
 `/{bucket}/{key}` path and does not implement virtual-hosted-style
 (`{bucket}.host`) addressing.
+
+## PBS setup: namespace and permissions
+
+The bridge maps each S3 bucket to one PBS namespace of the same (sanitized)
+name, but **it does not create that namespace itself** — doing so requires
+`Datastore.Modify`, which is deliberately not granted to the bridge's PBS
+user/token (see below). Before pointing Panel at a given `AWS_BUCKET`, an
+administrator must create the matching namespace once, e.g.:
+
+```sh
+proxmox-backup-client namespace create --ns pterodactyl-backups --repository <user>@<realm>@<host>:<datastore>
+```
+
+(or via the PBS web UI: Datastore -> your datastore -> Namespaces -> Create).
+Dots in the bucket name are replaced with dashes for the namespace name
+(e.g. bucket `my.backups` -> namespace `my-backups`).
+
+### Minimum required PBS permissions
+
+Grant the bridge's PBS user or API token the built-in **`DatastorePowerUser`**
+role on `/datastore/<datastore>` (or scoped down to
+`/datastore/<datastore>/<namespace>` per bucket, if you want stricter
+isolation between buckets):
+
+```sh
+proxmox-backup-manager acl update /datastore/<datastore> DatastorePowerUser --auth-id <user>@<realm>!<tokenname>
+```
+
+`DatastorePowerUser` grants exactly `Datastore.Backup` (create backups,
+restore/update notes on backups it owns) and `Datastore.Prune` (delete
+backups it owns) — confirmed against the proxmox-backup source
+(`pbs-api-types/src/acl.rs`). That's everything the bridge needs for
+backup/restore/delete; it deliberately does **not** include
+`Datastore.Modify`, since the bridge never creates namespaces or otherwise
+modifies datastore structure itself. Do not grant `DatastoreAdmin` — it's
+broader than necessary.
 
 ## Running
 

@@ -42,6 +42,23 @@ func SanitizeBackupID(key string) string {
 	return sanitized + "-" + suffix
 }
 
+// GroupIDFromKey extracts the part of an S3 key that identifies the PBS
+// backup group and sanitizes it into a valid backup-id, so that every
+// backup belonging to the same server becomes a new snapshot within one
+// shared group instead of each backup getting its own single-snapshot
+// group. Pterodactyl backup keys are shaped
+// "<server-uuid>/<backup-uuid>.tar.gz", so the group id is the first path
+// segment (the server UUID); if the key has no path segment, the whole
+// (sanitized) key is used as a fallback so behavior stays sane for
+// unexpected key shapes.
+func GroupIDFromKey(key string) string {
+	segment := key
+	if idx := strings.IndexByte(key, '/'); idx >= 0 {
+		segment = key[:idx]
+	}
+	return SanitizeBackupID(segment)
+}
+
 // stripKnownExtensions removes common Pterodactyl backup archive suffixes so
 // the resulting id reads cleanly (e.g. "<uuid>.tar.gz" -> "<uuid>").
 func stripKnownExtensions(key string) string {

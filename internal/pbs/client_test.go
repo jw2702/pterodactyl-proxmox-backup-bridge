@@ -139,17 +139,6 @@ func TestForget_IdempotentOnMissingSnapshot(t *testing.T) {
 	}
 }
 
-func TestEnsureNamespace_Idempotent(t *testing.T) {
-	c, _ := newTestClient(t)
-	ctx := context.Background()
-	if err := c.EnsureNamespace(ctx, "mybucket"); err != nil {
-		t.Fatalf("first EnsureNamespace: %v", err)
-	}
-	if err := c.EnsureNamespace(ctx, "mybucket"); err != nil {
-		t.Fatalf("second (idempotent) EnsureNamespace: %v", err)
-	}
-}
-
 func TestBackup_CollisionRetry(t *testing.T) {
 	c, _ := newTestClient(t)
 	t.Setenv("STUB_FORCE_COLLISION_COUNT", "2")

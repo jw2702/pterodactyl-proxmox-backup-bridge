@@ -80,12 +80,17 @@ func (b *Backend) commitObject(ctx context.Context, bucket, key, filePath string
 	unlock := b.Locks.Lock(lockKey(bucket, key))
 	defer unlock()
 
+	// Namespaces are NOT created by the bridge (that requires
+	// Datastore.Modify, which the bridge's PBS user/token intentionally
+	// does not have) — an administrator must pre-create the namespace for
+	// each bucket. See README.md.
 	ns := idmap.SanitizeNamespace(bucket)
-	if err := b.PBS.EnsureNamespace(ctx, ns); err != nil {
-		return s3api.ObjectInfo{}, fmt.Errorf("backend: ensuring namespace %q: %w", ns, err)
-	}
 
-	backupID := idmap.SanitizeBackupID(key)
+	// All backups belonging to the same server share one PBS backup group
+	// (derived from the server-UUID path segment of the key), with each
+	// individual backup becoming a new snapshot within that group, rather
+	// than every backup getting its own single-snapshot group.
+	backupID := idmap.GroupIDFromKey(key)
 	backupTime := time.Now().UTC()
 
 	usedTime, err := b.PBS.Backup(ctx, filePath, b.BackupType, backupID, backupTime, ns)

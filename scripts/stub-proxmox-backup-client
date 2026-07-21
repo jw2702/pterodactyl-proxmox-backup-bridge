@@ -183,25 +183,6 @@ case "$cmd" in
     esac
     ;;
 
-  namespace)
-    sub="$1"; shift
-    case "$sub" in
-      create)
-        ns="$(parse_ns "$@")"
-        dir="$(ns_dir "$ns")"
-        if [ -d "$dir" ]; then
-          echo "error: namespace already exists" >&2
-          exit 1
-        fi
-        mkdir -p "$dir"
-        ;;
-      *)
-        echo "error: unsupported namespace subcommand $sub" >&2
-        exit 1
-        ;;
-    esac
-    ;;
-
   --version)
     echo "stub-proxmox-backup-client 0.0.0-stub"
     ;;

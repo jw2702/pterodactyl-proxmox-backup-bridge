@@ -7,7 +7,16 @@
 //   - restore: proxmox-backup-client restore T/ID/RFC3339TIME <name>.img <target> --ns NS
 //   - forget:  proxmox-backup-client forget T/ID/RFC3339TIME --ns NS   (alias for "snapshot forget")
 //   - notes:   proxmox-backup-client snapshot notes update T/ID/RFC3339TIME "<notes>" --ns NS
-//   - ns:      proxmox-backup-client namespace create --ns NS
+//
+// The bridge does NOT create PBS namespaces itself (there is no
+// "namespace create" call anywhere in this package): doing so requires
+// Datastore.Modify, which is intentionally not granted to the bridge's PBS
+// user/token. Every namespace referenced by a bucket must be created
+// up front by an administrator (see README.md). With namespace creation
+// out of the picture, the bridge only ever needs Datastore.Backup (create/
+// restore/notes-update on groups it owns) and Datastore.Prune (forget its
+// own groups) — the built-in "DatastorePowerUser" PBS role grants exactly
+// that, with no Datastore.Modify at all.
 //
 // The ".img" archive type is used (rather than ".pxar" or ".blob", which
 // doesn't exist) because the client uploads it via plain
@@ -228,18 +237,5 @@ func (c *Client) UpdateNotes(ctx context.Context, backupType, backupID string, b
 		args = append(args, "--ns", namespace)
 	}
 	_, _, err := c.run(ctx, args...)
-	return err
-}
-
-// EnsureNamespace creates namespace if it doesn't already exist. Idempotent.
-func (c *Client) EnsureNamespace(ctx context.Context, namespace string) error {
-	if namespace == "" {
-		return nil
-	}
-	args := []string{"namespace", "create", "--ns", namespace}
-	_, _, err := c.run(ctx, args...)
-	if err != nil && IsAlreadyExists(err) {
-		return nil
-	}
 	return err
 }

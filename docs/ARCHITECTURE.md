@@ -37,11 +37,16 @@ In production that `Backend` is `internal/backend.Backend`, which combines:
 ## Object <-> snapshot mapping
 
 - One S3 **bucket** -> one PBS **namespace** (dots in the bucket name are
-  replaced with dashes; namespaces are created lazily via
-  `proxmox-backup-client namespace create`).
-- One S3 **key** -> one PBS **backup group** (`backup-type/backup-id`, with
-  `backup-id` derived deterministically from the key via
-  `idmap.SanitizeBackupID`).
+  replaced with dashes). The bridge does **not** create namespaces itself —
+  that requires `Datastore.Modify`, which its PBS user/token intentionally
+  does not have (see README.md). An administrator must create each bucket's
+  namespace up front.
+- All backups belonging to the same server share one PBS **backup group**
+  (`backup-type/backup-id`, with `backup-id` derived from the server-UUID
+  path segment of the key via `idmap.GroupIDFromKey`), with each individual
+  backup becoming a new **snapshot** within that group — matching normal PBS
+  usage (one group per "thing being backed up", a growing history of
+  snapshots within it) rather than a new single-snapshot group per backup.
 - Every object's bytes are stored as a single `data.img` archive inside the
   snapshot (`.img` is used — not `.blob`, which doesn't exist as an archive
   type in `proxmox-backup-client` — because the client uploads it via a
@@ -101,7 +106,7 @@ the scratch directory and bbolt record.
 
 CLI flag names and archive-type syntax (`--backup-type`, `--backup-id`,
 `--backup-time`, `--ns`, `--crypt-mode`, the `<type>/<id>/<RFC3339-time>`
-snapshot address format, `snapshot notes update`, `namespace create`) were
+snapshot address format, `snapshot notes update`) were
 confirmed both against the proxmox-backup source and by running
 `proxmox-backup-client <cmd> --help` inside the built Docker image against
 the actually-installed client (3.4.7 at the time of writing). Notably,
