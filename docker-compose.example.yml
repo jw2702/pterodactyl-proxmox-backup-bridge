@@ -1,0 +1,15 @@
+services:
+  pbs-bridge:
+    build: .
+    # or, once published: image: ghcr.io/yourorg/pterodactyl-proxmox-backup-bridge:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - bridge-data:/var/lib/bridge/data
+      - bridge-scratch:/var/lib/bridge/scratch
+
+volumes:
+  bridge-data:
+  bridge-scratch:

@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Fake proxmox-backup-client for local testing of internal/pbs and the
+# bridge's end-to-end HTTP lifecycle, without a real PBS server.
+#
+# State is kept under $STUB_PBS_STATE_DIR (default /tmp/pbs-stub-state) as
+# plain files: <state>/<ns-or-root>/<type>/<id>/<unixtime>/data.img and
+# .../notes. Every invocation is appended to $STUB_LOG_FILE (if set) as one
+# JSON-ish line, recording argv and which auth env vars were present (never
+# their values), so tests can assert on what the bridge actually invoked.
+#
+# Supported failure injection:
+#   STUB_FORCE_COLLISION_COUNT=N   the next N "backup" calls for a given
+#                                   (type,id) group fail with a
+#                                   backup-time-collision-shaped error before
+#                                   succeeding, to exercise the retry loop.
+
+set -euo pipefail
+
+STATE_DIR="${STUB_PBS_STATE_DIR:-/tmp/pbs-stub-state}"
+mkdir -p "$STATE_DIR"
+
+log() {
+  if [ -n "${STUB_LOG_FILE:-}" ]; then
+    local envflags=""
+    [ -n "${PBS_REPOSITORY:-}" ] && envflags="${envflags}PBS_REPOSITORY,"
+    [ -n "${PBS_PASSWORD:-}" ] && envflags="${envflags}PBS_PASSWORD,"
+    [ -n "${PBS_FINGERPRINT:-}" ] && envflags="${envflags}PBS_FINGERPRINT,"
+    printf '{"args":"%s","env":"%s"}\n' "$*" "$envflags" >> "$STUB_LOG_FILE"
+  fi
+}
+
+ns_dir() {
+  local ns="$1"
+  if [ -z "$ns" ]; then
+    echo "$STATE_DIR/root"
+  else
+    echo "$STATE_DIR/ns/$ns"
+  fi
+}
+
+parse_ns() {
+  local ns=""
+  local args=("$@")
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    if [ "${args[$i]}" = "--ns" ]; then
+      ns="${args[$((i + 1))]}"
+    fi
+  done
+  echo "$ns"
+}
+
+cmd="${1:-}"
+shift || true
+log "$cmd" "$@"
+
+case "$cmd" in
+  backup)
+    archivespec="$1"; shift
+    archive_name="${archivespec%%:*}"
+    src_path="${archivespec#*:}"
+
+    backup_type="host"
+    backup_id=""
+    backup_time=""
+    ns=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --backup-type) backup_type="$2"; shift 2 ;;
+        --backup-id) backup_id="$2"; shift 2 ;;
+        --backup-time) backup_time="$2"; shift 2 ;;
+        --ns) ns="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+
+    if [ -z "$backup_id" ] || [ -z "$backup_time" ]; then
+      echo "error: missing --backup-id or --backup-time" >&2
+      exit 1
+    fi
+
+    group_dir="$(ns_dir "$ns")/$backup_type/$backup_id"
+    collision_marker="$group_dir/.collision-count"
+    mkdir -p "$group_dir"
+
+    remaining=0
+    if [ -f "$collision_marker" ]; then
+      remaining=$(cat "$collision_marker")
+    elif [ -n "${STUB_FORCE_COLLISION_COUNT:-}" ] && [ ! -f "$group_dir/.collision-initialized" ]; then
+      remaining="$STUB_FORCE_COLLISION_COUNT"
+      touch "$group_dir/.collision-initialized"
+    fi
+
+    if [ "$remaining" -gt 0 ] 2>/dev/null; then
+      echo $((remaining - 1)) > "$collision_marker"
+      echo "error: backup time in the past" >&2
+      exit 1
+    fi
+
+    snap_dir="$group_dir/$backup_time"
+    mkdir -p "$snap_dir"
+    cp "$src_path" "$snap_dir/$archive_name"
+    echo "snapshot ${backup_type}/${backup_id}/${backup_time} created"
+    ;;
+
+  restore)
+    snapshot="$1"; shift
+    archive_name="$1"; shift
+    target="$1"; shift
+    ns="$(parse_ns "$@")"
+
+    IFS='/' read -r backup_type backup_id backup_time_rfc <<< "$snapshot"
+    backup_time=$(date -u -d "$backup_time_rfc" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$backup_time_rfc" +%s)
+
+    snap_dir="$(ns_dir "$ns")/$backup_type/$backup_id/$backup_time"
+    if [ ! -f "$snap_dir/$archive_name" ]; then
+      echo "error: no such snapshot $snapshot" >&2
+      exit 1
+    fi
+    cp "$snap_dir/$archive_name" "$target"
+    ;;
+
+  forget)
+    snapshot="$1"; shift
+    ns="$(parse_ns "$@")"
+    IFS='/' read -r backup_type backup_id backup_time_rfc <<< "$snapshot"
+    backup_time=$(date -u -d "$backup_time_rfc" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$backup_time_rfc" +%s)
+    snap_dir="$(ns_dir "$ns")/$backup_type/$backup_id/$backup_time"
+    if [ ! -d "$snap_dir" ]; then
+      echo "error: no such snapshot $snapshot" >&2
+      exit 1
+    fi
+    rm -rf "$snap_dir"
+    ;;
+
+  snapshot)
+    sub="$1"; shift
+    case "$sub" in
+      notes)
+        action="$1"; shift # "update"
+        snapshot="$1"; shift
+        notes="$1"; shift
+        ns="$(parse_ns "$@")"
+        IFS='/' read -r backup_type backup_id backup_time_rfc <<< "$snapshot"
+        backup_time=$(date -u -d "$backup_time_rfc" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$backup_time_rfc" +%s)
+        snap_dir="$(ns_dir "$ns")/$backup_type/$backup_id/$backup_time"
+        if [ ! -d "$snap_dir" ]; then
+          echo "error: no such snapshot $snapshot" >&2
+          exit 1
+        fi
+        printf '%s' "$notes" > "$snap_dir/notes"
+        ;;
+      forget)
+        snapshot="$1"; shift
+        ns="$(parse_ns "$@")"
+        IFS='/' read -r backup_type backup_id backup_time_rfc <<< "$snapshot"
+        backup_time=$(date -u -d "$backup_time_rfc" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$backup_time_rfc" +%s)
+        snap_dir="$(ns_dir "$ns")/$backup_type/$backup_id/$backup_time"
+        rm -rf "$snap_dir"
+        ;;
+      *)
+        echo "error: unsupported snapshot subcommand $sub" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+
+  namespace)
+    sub="$1"; shift
+    case "$sub" in
+      create)
+        ns="$(parse_ns "$@")"
+        dir="$(ns_dir "$ns")"
+        if [ -d "$dir" ]; then
+          echo "error: namespace already exists" >&2
+          exit 1
+        fi
+        mkdir -p "$dir"
+        ;;
+      *)
+        echo "error: unsupported namespace subcommand $sub" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+
+  --version)
+    echo "stub-proxmox-backup-client 0.0.0-stub"
+    ;;
+
+  *)
+    echo "error: unsupported command $cmd" >&2
+    exit 1
+    ;;
+esac
