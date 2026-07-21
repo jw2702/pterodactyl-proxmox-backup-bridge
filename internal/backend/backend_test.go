@@ -192,6 +192,118 @@ func TestMultipartUploadLifecycle(t *testing.T) {
 	}
 }
 
+// TestCompleteMultipartUpload_RetryAfterTransientPBSFailure mirrors what
+// actually happens in production: Panel's AWS SDK client automatically
+// retries a failed CompleteMultipartUpload call with the same upload ID (no
+// re-upload of parts). The backend must be able to satisfy that retry using
+// the already-concatenated final file, since the original parts are deleted
+// as soon as they're consumed during concatenation.
+func TestCompleteMultipartUpload_RetryAfterTransientPBSFailure(t *testing.T) {
+	b := newTestBackend(t)
+	t.Setenv("STUB_FORCE_BACKUP_FAIL_COUNT", "1")
+	ctx := context.Background()
+
+	uploadID, err := b.CreateMultipartUpload(ctx, "mybucket", "retry-test.tar.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	partData := [][]byte{
+		bytes.Repeat([]byte("X"), 5),
+		bytes.Repeat([]byte("Y"), 5),
+	}
+	var parts []s3api.Part
+	for i, pd := range partData {
+		etag, err := b.UploadPart(ctx, "mybucket", "retry-test.tar.gz", uploadID, i+1, bytes.NewReader(pd))
+		if err != nil {
+			t.Fatalf("UploadPart %d: %v", i+1, err)
+		}
+		parts = append(parts, s3api.Part{PartNumber: i + 1, ETag: etag})
+	}
+
+	// Sanity check: parts are on disk as separate files at this point.
+	partPath := b.Stage.PartPath(uploadID, 1)
+	if _, err := os.Stat(partPath); err != nil {
+		t.Fatalf("expected part file to exist before Complete: %v", err)
+	}
+
+	// First attempt: the stub PBS client is configured to fail once here.
+	_, err = b.CompleteMultipartUpload(ctx, "mybucket", "retry-test.tar.gz", uploadID, parts)
+	if err == nil {
+		t.Fatal("expected first CompleteMultipartUpload attempt to fail (simulated transient PBS error)")
+	}
+
+	// The concatenated final file must have survived the failure (it's what
+	// the retry needs), while the original part file must already be gone
+	// (freed as soon as it was consumed during concatenation).
+	if _, err := os.Stat(partPath); !os.IsNotExist(err) {
+		t.Fatalf("expected part file to already be removed after concatenation, stat err = %v", err)
+	}
+	finalPath := filepath.Join(b.Stage.UploadDir(uploadID), "final.img")
+	if _, err := os.Stat(finalPath); err != nil {
+		t.Fatalf("expected concatenated final.img to survive the failed attempt: %v", err)
+	}
+
+	// Second attempt: same uploadID, same parts list, exactly what Panel's
+	// AWS SDK automatic retry sends. Must succeed without needing the
+	// already-deleted part files.
+	info, err := b.CompleteMultipartUpload(ctx, "mybucket", "retry-test.tar.gz", uploadID, parts)
+	if err != nil {
+		t.Fatalf("expected retry to succeed: %v", err)
+	}
+	want := "XXXXXYYYYY"
+	if info.Size != int64(len(want)) {
+		t.Fatalf("size = %d, want %d", info.Size, len(want))
+	}
+
+	rc, _, err := b.GetObject(ctx, "mybucket", "retry-test.tar.gz")
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+	if string(got) != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+
+	// And now everything should be cleaned up.
+	if _, err := b.Store.GetUpload(uploadID); err == nil {
+		t.Fatal("expected upload record to be removed after successful retry")
+	}
+	if _, err := os.Stat(b.Stage.UploadDir(uploadID)); !os.IsNotExist(err) {
+		t.Fatalf("expected upload scratch dir removed after successful retry, stat err = %v", err)
+	}
+}
+
+func TestDeleteObject_AbortsMatchingInProgressUpload(t *testing.T) {
+	// Mirrors Pterodactyl Panel's behavior: deleting a backup that never
+	// finished uploading issues a plain DeleteObject for the eventual key,
+	// not AbortMultipartUpload. The backend must still clean up the
+	// abandoned multipart scratch data in that case.
+	b := newTestBackend(t)
+	ctx := context.Background()
+
+	uploadID, err := b.CreateMultipartUpload(ctx, "mybucket", "stuck-backup.tar.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.UploadPart(ctx, "mybucket", "stuck-backup.tar.gz", uploadID, 1, bytes.NewReader([]byte("partial data"))); err != nil {
+		t.Fatal(err)
+	}
+
+	err = b.DeleteObject(ctx, "mybucket", "stuck-backup.tar.gz")
+	if err != s3api.ErrNotFound {
+		t.Fatalf("expected ErrNotFound (idempotent) from DeleteObject, got %v", err)
+	}
+
+	if _, err := b.Store.GetUpload(uploadID); err == nil {
+		t.Fatal("expected orphaned upload record to be removed")
+	}
+	if _, err := os.Stat(b.Stage.UploadDir(uploadID)); !os.IsNotExist(err) {
+		t.Fatalf("expected scratch dir removed, stat err = %v", err)
+	}
+}
+
 func TestAbortMultipartUpload_CleansUpScratch(t *testing.T) {
 	b := newTestBackend(t)
 	ctx := context.Background()

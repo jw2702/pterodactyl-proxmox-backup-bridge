@@ -2,6 +2,7 @@ package s3api
 
 import (
 	"encoding/xml"
+	"log/slog"
 	"net/http"
 
 	"github.com/pterodactyl-proxmox-backup-bridge/bridge/internal/sigv4"
@@ -53,6 +54,12 @@ func writeAuthError(w http.ResponseWriter, r *http.Request, err *sigv4.AuthError
 }
 
 func writeInternalError(w http.ResponseWriter, r *http.Request, err error) {
+	// The error text is also returned to the client in the XML Message
+	// field (so it surfaces in Panel's own logs via the S3 SDK exception),
+	// but log it server-side too so it's visible without needing to dig
+	// through Panel's logs.
+	slog.Default().Error("internal error handling S3 request",
+		"method", r.Method, "path", r.URL.Path, "request_id", requestID(r), "error", err)
 	writeErrorCode(w, r, "InternalError", err.Error())
 }
 

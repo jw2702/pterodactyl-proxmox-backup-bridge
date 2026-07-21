@@ -71,38 +71,84 @@ func (m *Manager) RemoveUploadDir(uploadID string) error {
 	return os.RemoveAll(m.UploadDir(uploadID))
 }
 
-// ConcatParts concatenates the given file paths, in order, into a single new
-// temp file and returns its path and total size. It does not delete the
-// source part files; callers should do so (via RemoveUploadDir) once the PBS
-// backup invocation using the result has completed.
+// ConcatParts concatenates the given file paths, in order, into a single
+// file at a deterministic path within the upload's scratch directory and
+// returns its path and total size.
+//
+// Each source part is removed immediately after its bytes have been copied,
+// rather than left for bulk cleanup afterwards, so that peak scratch disk
+// usage during the (fast, local) concatenation step is roughly "final size +
+// one part" instead of "final size + all parts". The output is written to a
+// ".partial" name and atomically renamed into place only once every part has
+// been consumed successfully — if concatenation itself fails partway
+// through, the caller must treat the whole upload as unrecoverable (some
+// parts will already be gone) rather than retry.
+//
+// If the deterministic final path already exists (a previous call already
+// completed the concatenation but a *later* step — the actual PBS upload —
+// failed and the caller is retrying), it is reused as-is instead of
+// re-reading parts that were already deleted. This is what makes retrying
+// CompleteMultipartUpload after a transient PBS/network failure safe without
+// holding parts and the final file simultaneously for the entire (often
+// much slower) PBS upload: Pterodactyl Panel's AWS SDK client automatically
+// retries a failed CompleteMultipartUpload call with the same upload ID.
 func (m *Manager) ConcatParts(uploadID string, partPaths []string) (WriteResult, error) {
 	dir := m.UploadDir(uploadID)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return WriteResult{}, fmt.Errorf("stage: creating dir %s: %w", dir, err)
 	}
 
-	out, err := os.CreateTemp(dir, "final-*.blob")
+	finalPath := filepath.Join(dir, "final.img")
+	if info, err := os.Stat(finalPath); err == nil {
+		return hashExistingFile(finalPath, info.Size())
+	}
+
+	tmpPath := finalPath + ".partial"
+	out, err := os.Create(tmpPath)
 	if err != nil {
 		return WriteResult{}, fmt.Errorf("stage: creating final file: %w", err)
 	}
-	defer out.Close()
 
 	h := md5.New()
 	var total int64
 	for _, p := range partPaths {
-		in, err := os.Open(p)
-		if err != nil {
-			return WriteResult{}, fmt.Errorf("stage: opening part %s: %w", p, err)
+		in, openErr := os.Open(p)
+		if openErr != nil {
+			out.Close()
+			_ = os.Remove(tmpPath)
+			return WriteResult{}, fmt.Errorf("stage: opening part %s: %w", p, openErr)
 		}
-		n, err := io.Copy(io.MultiWriter(out, h), in)
+		n, copyErr := io.Copy(io.MultiWriter(out, h), in)
 		in.Close()
-		if err != nil {
-			return WriteResult{}, fmt.Errorf("stage: concatenating part %s: %w", p, err)
+		if copyErr != nil {
+			out.Close()
+			_ = os.Remove(tmpPath)
+			return WriteResult{}, fmt.Errorf("stage: concatenating part %s: %w", p, copyErr)
 		}
 		total += n
+		_ = os.Remove(p)
+	}
+	if err := out.Close(); err != nil {
+		return WriteResult{}, fmt.Errorf("stage: closing final file: %w", err)
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		return WriteResult{}, fmt.Errorf("stage: finalizing final file: %w", err)
 	}
 
-	return WriteResult{Path: out.Name(), Size: total, MD5: hex.EncodeToString(h.Sum(nil))}, nil
+	return WriteResult{Path: finalPath, Size: total, MD5: hex.EncodeToString(h.Sum(nil))}, nil
+}
+
+func hashExistingFile(path string, size int64) (WriteResult, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("stage: reopening existing final file: %w", err)
+	}
+	defer f.Close()
+	h := md5.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return WriteResult{}, fmt.Errorf("stage: hashing existing final file: %w", err)
+	}
+	return WriteResult{Path: path, Size: size, MD5: hex.EncodeToString(h.Sum(nil))}, nil
 }
 
 // TempFilePath allocates a fresh, unique file path under dir (relative to

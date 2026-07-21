@@ -80,6 +80,7 @@ case "$cmd" in
 
     group_dir="$(ns_dir "$ns")/$backup_type/$backup_id"
     collision_marker="$group_dir/.collision-count"
+    fail_marker="$group_dir/.fail-count"
     mkdir -p "$group_dir"
 
     remaining=0
@@ -93,6 +94,20 @@ case "$cmd" in
     if [ "$remaining" -gt 0 ] 2>/dev/null; then
       echo $((remaining - 1)) > "$collision_marker"
       echo "error: backup time in the past" >&2
+      exit 1
+    fi
+
+    fail_remaining=0
+    if [ -f "$fail_marker" ]; then
+      fail_remaining=$(cat "$fail_marker")
+    elif [ -n "${STUB_FORCE_BACKUP_FAIL_COUNT:-}" ] && [ ! -f "$group_dir/.fail-initialized" ]; then
+      fail_remaining="$STUB_FORCE_BACKUP_FAIL_COUNT"
+      touch "$group_dir/.fail-initialized"
+    fi
+
+    if [ "$fail_remaining" -gt 0 ] 2>/dev/null; then
+      echo $((fail_remaining - 1)) > "$fail_marker"
+      echo "error: simulated transient failure" >&2
       exit 1
     fi
 

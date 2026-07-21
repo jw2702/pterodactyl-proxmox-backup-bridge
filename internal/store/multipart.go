@@ -143,6 +143,29 @@ func (db *DB) ListUploadsOlderThan(cutoff time.Time) ([]MultipartUpload, error) 
 	return uploads, err
 }
 
+// FindUploadsByBucketKey returns all in-progress multipart uploads targeting
+// the given bucket/key. Pterodactyl Panel's "delete backup" action on a
+// still-in-progress backup issues a plain DeleteObject (not
+// AbortMultipartUpload) for the eventual object key, so this lookup lets
+// DeleteObject find and clean up any matching abandoned upload(s) instead of
+// leaving them for the GC's TTL sweep.
+func (db *DB) FindUploadsByBucketKey(bucket, key string) ([]MultipartUpload, error) {
+	var uploads []MultipartUpload
+	err := db.bolt.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketMultipartUploads).ForEach(func(k, v []byte) error {
+			var u MultipartUpload
+			if err := json.Unmarshal(v, &u); err != nil {
+				return err
+			}
+			if u.Bucket == bucket && u.Key == key {
+				uploads = append(uploads, u)
+			}
+			return nil
+		})
+	})
+	return uploads, err
+}
+
 // ListAllUploadIDs returns every tracked upload ID, used at startup to
 // reconcile against orphaned scratch directories.
 func (db *DB) ListAllUploadIDs() ([]string, error) {

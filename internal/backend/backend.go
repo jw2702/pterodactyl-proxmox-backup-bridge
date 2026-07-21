@@ -185,7 +185,16 @@ func (b *Backend) DeleteObject(ctx context.Context, bucket, key string) error {
 
 	mapping, err := b.Store.GetObjectMapping(bucket, key)
 	if err != nil {
-		return mapNotFound(err)
+		if !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		// No completed object at this key. Pterodactyl Panel's "delete
+		// backup" action on a still-in-progress (never-completed) backup
+		// issues exactly this DeleteObject call rather than
+		// AbortMultipartUpload, so clean up any matching abandoned
+		// multipart upload(s) now instead of leaving their scratch data
+		// for the GC's TTL sweep.
+		return b.abortMatchingUploads(bucket, key)
 	}
 	if err := b.PBS.Forget(ctx, mapping.PBSBackupType, mapping.PBSBackupID, time.Unix(mapping.PBSBackupTime, 0), mapping.Namespace); err != nil {
 		return fmt.Errorf("backend: pbs forget failed: %w", err)
@@ -194,6 +203,26 @@ func (b *Backend) DeleteObject(ctx context.Context, bucket, key string) error {
 		return mapNotFound(err)
 	}
 	return nil
+}
+
+// abortMatchingUploads finds and removes any in-progress multipart upload(s)
+// for bucket/key. Always returns nil (mapNotFound-equivalent) so DeleteObject
+// stays idempotent from the caller's perspective even when there was nothing
+// to clean up, matching S3 DeleteObject semantics.
+func (b *Backend) abortMatchingUploads(bucket, key string) error {
+	uploads, err := b.Store.FindUploadsByBucketKey(bucket, key)
+	if err != nil {
+		return err
+	}
+	for _, u := range uploads {
+		if err := b.Stage.RemoveUploadDir(u.UploadID); err != nil {
+			b.log().Error("backend: removing scratch dir for aborted upload failed", "upload_id", u.UploadID, "bucket", bucket, "key", key, "error", err)
+		}
+		if err := b.Store.DeleteUpload(u.UploadID); err != nil {
+			b.log().Error("backend: deleting aborted upload record failed", "upload_id", u.UploadID, "bucket", bucket, "key", key, "error", err)
+		}
+	}
+	return s3api.ErrNotFound
 }
 
 func (b *Backend) ListObjects(ctx context.Context, bucket, prefix, delimiter, startAfter string, maxKeys int) ([]s3api.ObjectInfo, []string, bool, error) {
@@ -317,22 +346,42 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uplo
 
 	final, err := b.Stage.ConcatParts(uploadID, paths)
 	if err != nil {
+		// ConcatParts may have partially run before failing; whatever part
+		// files remain plus any partial output are cleaned up immediately
+		// rather than left for the GC's TTL sweep.
+		b.cleanupUpload(uploadID)
 		return s3api.ObjectInfo{}, err
 	}
 
 	info, err := b.commitObject(ctx, upload.Bucket, upload.Key, final.Path, final.Size, final.MD5)
 	if err != nil {
+		// Deliberately do NOT clean up here: Panel's AWS SDK client
+		// automatically retries a failed CompleteMultipartUpload with the
+		// same upload ID (observed directly in production logs), and
+		// stage.ConcatParts already deleted the source parts as it went —
+		// so final.img (still on disk; commitObject only removes it on
+		// success) is the only thing a retry can succeed against. It's
+		// reclaimed on a later successful retry, an explicit
+		// Abort/DeleteObject call, or the GC's TTL sweep if the upload is
+		// truly abandoned.
 		return s3api.ObjectInfo{}, err
 	}
 
+	b.cleanupUpload(uploadID)
+	return info, nil
+}
+
+// cleanupUpload removes an upload's scratch directory and bbolt record,
+// logging (but not failing on) any error — used both on the success and
+// failure paths of CompleteMultipartUpload so scratch disk usage is
+// reclaimed immediately instead of waiting on the GC's TTL sweep.
+func (b *Backend) cleanupUpload(uploadID string) {
 	if err := b.Stage.RemoveUploadDir(uploadID); err != nil {
-		b.log().Error("backend: removing upload scratch dir after complete failed", "upload_id", uploadID, "error", err)
+		b.log().Error("backend: removing upload scratch dir failed", "upload_id", uploadID, "error", err)
 	}
 	if err := b.Store.DeleteUpload(uploadID); err != nil {
-		b.log().Error("backend: deleting upload record after complete failed", "upload_id", uploadID, "error", err)
+		b.log().Error("backend: deleting upload record failed", "upload_id", uploadID, "error", err)
 	}
-
-	return info, nil
 }
 
 func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
