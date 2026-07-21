@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -53,6 +54,17 @@ func snapshotID(backupType, backupID string, backupTime time.Time) string {
 	return fmt.Sprintf("%s/%s/%s", backupType, backupID, backupTime.UTC().Format("2006-01-02T15:04:05Z"))
 }
 
+// env builds the child process environment: the current process environment
+// (tests rely on this to pass STUB_* vars through to
+// scripts/stub-proxmox-backup-client) with the PBS auth vars layered on top.
+func (c *Client) env() []string {
+	env := append([]string(nil), os.Environ()...)
+	env = append(env, envIfSet("PBS_REPOSITORY", c.Repository)...)
+	env = append(env, envIfSet("PBS_PASSWORD", c.Password)...)
+	env = append(env, envIfSet("PBS_FINGERPRINT", c.Fingerprint)...)
+	return env
+}
+
 func (c *Client) run(ctx context.Context, args ...string) (stdout, stderr string, err error) {
 	if c.Timeout > 0 {
 		var cancel context.CancelFunc
@@ -61,13 +73,7 @@ func (c *Client) run(ctx context.Context, args ...string) (stdout, stderr string
 	}
 
 	cmd := exec.CommandContext(ctx, c.binPath(), args...)
-	// Start from the process environment (tests rely on this to pass
-	// STUB_* vars through to scripts/stub-proxmox-backup-client), then layer
-	// the PBS auth vars on top.
-	cmd.Env = append(cmd.Env, os.Environ()...)
-	cmd.Env = append(cmd.Env, envIfSet("PBS_REPOSITORY", c.Repository)...)
-	cmd.Env = append(cmd.Env, envIfSet("PBS_PASSWORD", c.Password)...)
-	cmd.Env = append(cmd.Env, envIfSet("PBS_FINGERPRINT", c.Fingerprint)...)
+	cmd.Env = c.env()
 
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
@@ -132,6 +138,69 @@ func (c *Client) Restore(ctx context.Context, backupType, backupID string, backu
 	}
 	_, _, err := c.run(ctx, args...)
 	return err
+}
+
+// RestoreStream runs `restore <snapshot> data.img -`, piping the archive
+// directly to the returned io.ReadCloser instead of writing it to a local
+// file first. This matters beyond just disk usage: Wings' own restore
+// handler blocks on receiving HTTP response headers from this GET before it
+// responds to Panel at all (it only backgrounds the actual file restore
+// afterwards), so any delay here before the bridge can start writing a
+// response directly inflates the Panel-visible request time and can trip
+// Panel's own HTTP client timeout. The caller must read the stream to EOF
+// (or cancel ctx) and always call Close(), which waits for the subprocess
+// and surfaces any error it reported.
+//
+// Not used for ranged reads: an arbitrary byte range can't be sliced out of
+// a live pipe, so callers wanting a specific range should use Restore (to a
+// local file) instead and slice that.
+func (c *Client) RestoreStream(ctx context.Context, backupType, backupID string, backupTime time.Time, namespace string) (io.ReadCloser, error) {
+	args := []string{"restore", snapshotID(backupType, backupID, backupTime), ArchiveName, "-", "--crypt-mode", "none"}
+	if namespace != "" {
+		args = append(args, "--ns", namespace)
+	}
+
+	cmd := exec.CommandContext(ctx, c.binPath(), args...)
+	cmd.Env = c.env()
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("pbs: creating stdout pipe: %w", err)
+	}
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("pbs: starting restore: %w", err)
+	}
+
+	return &restoreStream{stdout: stdout, cmd: cmd, stderr: &stderrBuf, args: args}, nil
+}
+
+// restoreStream adapts a running `restore ... -` subprocess to io.ReadCloser.
+type restoreStream struct {
+	stdout io.ReadCloser
+	cmd    *exec.Cmd
+	stderr *bytes.Buffer
+	args   []string
+}
+
+func (r *restoreStream) Read(p []byte) (int, error) {
+	return r.stdout.Read(p)
+}
+
+// Close closes the stdout pipe (if not already fully drained) and waits for
+// the subprocess to exit, returning a classified error if it failed. Callers
+// that abandon the read (e.g. an HTTP client disconnects mid-download) will
+// have the underlying process killed automatically since it's started with
+// exec.CommandContext against the same context the caller's request derives
+// from.
+func (r *restoreStream) Close() error {
+	_ = r.stdout.Close()
+	if err := r.cmd.Wait(); err != nil {
+		return classifyError(r.args, err, r.stderr.String())
+	}
+	return nil
 }
 
 // Forget removes a snapshot. A "snapshot not found" error is treated as

@@ -21,11 +21,10 @@ type Part struct {
 	ETag       string
 }
 
-// ReadSeekCloser is the minimal interface GetObject results must satisfy.
-type ReadSeekCloser interface {
-	io.Reader
-	io.Seeker
-	io.Closer
+// RangeSpec is an inclusive byte range requested via an HTTP Range header.
+// A nil *RangeSpec passed to Backend.GetObject means "the whole object".
+type RangeSpec struct {
+	Start, End int64
 }
 
 // ErrNotFound is returned by Backend methods when a bucket/key or upload ID
@@ -43,10 +42,17 @@ func (notFoundError) Error() string { return "not found" }
 // HTTP/SigV4 layer in isolation.
 type Backend interface {
 	PutObject(ctx context.Context, bucket, key string, body io.Reader) (ObjectInfo, error)
-	// GetObject returns an io.ReadSeekCloser (backed by a real file, since PBS
-	// restores full files) so the handler can serve HTTP Range requests by
-	// seeking rather than requiring true partial-restore support from PBS.
-	GetObject(ctx context.Context, bucket, key string) (ReadSeekCloser, ObjectInfo, error)
+	// GetObject returns the object's bytes. When rangeSpec is nil the
+	// implementation should stream directly from the backing store without
+	// buffering the whole object first (important for time-to-first-byte:
+	// Wings blocks its own response to Panel on receiving HTTP response
+	// headers from this call before backgrounding the actual restore, so
+	// any buffering delay here directly causes Panel-side request
+	// timeouts). When rangeSpec is non-nil, the implementation may need to
+	// materialize the object locally first in order to serve an arbitrary
+	// byte range; slicing to exactly [Start, End] is the implementation's
+	// responsibility, not the caller's.
+	GetObject(ctx context.Context, bucket, key string, rangeSpec *RangeSpec) (io.ReadCloser, ObjectInfo, error)
 	HeadObject(ctx context.Context, bucket, key string) (ObjectInfo, error)
 	DeleteObject(ctx context.Context, bucket, key string) error
 	ListObjects(ctx context.Context, bucket, prefix, delimiter, startAfter string, maxKeys int) (objects []ObjectInfo, commonPrefixes []string, isTruncated bool, err error)

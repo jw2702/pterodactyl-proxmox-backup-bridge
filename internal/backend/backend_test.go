@@ -54,6 +54,72 @@ func newTestBackend(t *testing.T) *Backend {
 	return New(db, stg, client, "host", nil)
 }
 
+// TestGetObject_FullReadDoesNotMaterializeLocalFile confirms the fix for
+// Wings' restore-request timeout: a full (non-Range) GetObject must stream
+// directly from proxmox-backup-client rather than first restoring the whole
+// object to a local scratch file (which was what made Wings wait long
+// enough for Panel's own HTTP client to time out).
+func TestGetObject_FullReadDoesNotMaterializeLocalFile(t *testing.T) {
+	b := newTestBackend(t)
+	ctx := context.Background()
+
+	body := []byte("streamed, not staged")
+	if _, err := b.PutObject(ctx, "mybucket", "streamkey", bytes.NewReader(body)); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	getsDir := filepath.Join(b.Stage.Root, "gets")
+
+	rc, _, err := b.GetObject(ctx, "mybucket", "streamkey", nil)
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("got %q, want %q", got, body)
+	}
+
+	entries, err := os.ReadDir(getsDir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected no files staged under %s for a full GetObject, found %d", getsDir, len(entries))
+	}
+}
+
+func TestGetObject_RangeStillUsesLocalFile(t *testing.T) {
+	b := newTestBackend(t)
+	ctx := context.Background()
+
+	body := []byte("0123456789")
+	if _, err := b.PutObject(ctx, "mybucket", "rangekey", bytes.NewReader(body)); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	rc, _, err := b.GetObject(ctx, "mybucket", "rangekey", &s3api.RangeSpec{Start: 2, End: 5})
+	if err != nil {
+		t.Fatalf("GetObject with range: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	want := body[2:6]
+	if string(got) != string(want) {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestPutGetHeadDeleteObject(t *testing.T) {
 	b := newTestBackend(t)
 	ctx := context.Background()
@@ -75,7 +141,7 @@ func TestPutGetHeadDeleteObject(t *testing.T) {
 		t.Fatalf("HeadObject ETag mismatch: %s vs %s", head.ETag, info.ETag)
 	}
 
-	rc, gotInfo, err := b.GetObject(ctx, "mybucket", "mykey.tar.gz")
+	rc, gotInfo, err := b.GetObject(ctx, "mybucket", "mykey.tar.gz", nil)
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)
 	}
@@ -134,7 +200,7 @@ func TestOverwrite_CreatesNewBeforeForgettingOld(t *testing.T) {
 		t.Fatal("expected old snapshot to have been forgotten after overwrite")
 	}
 
-	rc, _, err := b.GetObject(ctx, "mybucket", "samekey")
+	rc, _, err := b.GetObject(ctx, "mybucket", "samekey", nil)
 	if err != nil {
 		t.Fatalf("GetObject after overwrite: %v", err)
 	}
@@ -177,7 +243,7 @@ func TestMultipartUploadLifecycle(t *testing.T) {
 		t.Fatalf("size = %d, want %d", info.Size, len(want))
 	}
 
-	rc, _, err := b.GetObject(ctx, "mybucket", "bigfile.tar.gz")
+	rc, _, err := b.GetObject(ctx, "mybucket", "bigfile.tar.gz", nil)
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)
 	}
@@ -256,7 +322,7 @@ func TestCompleteMultipartUpload_RetryAfterTransientPBSFailure(t *testing.T) {
 		t.Fatalf("size = %d, want %d", info.Size, len(want))
 	}
 
-	rc, _, err := b.GetObject(ctx, "mybucket", "retry-test.tar.gz")
+	rc, _, err := b.GetObject(ctx, "mybucket", "retry-test.tar.gz", nil)
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)
 	}

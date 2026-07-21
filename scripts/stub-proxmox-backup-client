@@ -131,7 +131,11 @@ case "$cmd" in
       echo "error: no such snapshot $snapshot" >&2
       exit 1
     fi
-    cp "$snap_dir/$archive_name" "$target"
+    if [ "$target" = "-" ]; then
+      cat "$snap_dir/$archive_name"
+    else
+      cp "$snap_dir/$archive_name" "$target"
+    fi
     ;;
 
   forget)

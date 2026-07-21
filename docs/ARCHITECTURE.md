@@ -66,6 +66,26 @@ mutex (`internal/store.KeyedMutex`):
 This guarantees there's never a window where the key has no valid backing
 snapshot.
 
+## GetObject: streaming vs. restore-then-slice
+
+`s3api.Backend.GetObject` takes an optional `*RangeSpec`. When nil (the
+common case — Wings' own S3 restore path never requests a range), the
+production backend calls `pbs.Client.RestoreStream`, which runs
+`proxmox-backup-client restore ... -` and pipes stdout directly into the
+HTTP response; no local scratch file is involved. This matters beyond disk
+usage: Wings' restore handler blocks on receiving HTTP response *headers*
+from this request before it responds to Panel at all (the real file restore
+only happens in a background goroutine afterwards), so any delay before the
+bridge can start writing a response directly inflates the time Panel waits
+— and can trip Panel's own client-side HTTP timeout on larger backups if the
+bridge instead buffered the whole restore to disk first before responding.
+
+When a `*RangeSpec` is present, a live subprocess pipe can't be seeked, so
+the backend falls back to restoring the full snapshot to a scratch file via
+`pbs.Client.Restore` and slicing the requested byte range from that file
+(the original "restore-then-slice" approach), cleaning up the scratch file
+on `Close`.
+
 ## Multipart upload lifecycle
 
 `CreateMultipartUpload` allocates an upload ID and a bbolt record.

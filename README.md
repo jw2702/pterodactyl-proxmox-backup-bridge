@@ -26,10 +26,11 @@ Panel/Wings (S3 SDK, presigned URLs)
   backup archive in parts directly to presigned PUT URLs; Panel completes
   the upload. The bridge concatenates the parts on `CompleteMultipartUpload`
   and runs a single `proxmox-backup-client backup` for the whole archive.
-- **Restore**: Panel gives Wings a presigned GET URL; the bridge runs
-  `proxmox-backup-client restore` to a scratch file and streams it back
-  (including HTTP Range support, restore-then-slice — see
-  [docs/LIMITATIONS.md](docs/LIMITATIONS.md)).
+- **Restore**: Panel gives Wings a presigned GET URL; the bridge streams
+  `proxmox-backup-client restore ... -` directly into the HTTP response with
+  no local scratch file (important for time-to-first-byte — see
+  [docs/LIMITATIONS.md](docs/LIMITATIONS.md)). Range requests are the
+  exception and still restore-then-slice via a scratch file.
 - **Delete**: Panel calls `DeleteObject` directly; the bridge runs
   `proxmox-backup-client forget`.
 

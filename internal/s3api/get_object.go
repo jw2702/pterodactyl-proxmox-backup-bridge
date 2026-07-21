@@ -10,7 +10,34 @@ import (
 )
 
 func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	body, info, err := h.Backend.GetObject(r.Context(), bucket, key)
+	// HeadObject is a pure metadata lookup (no PBS call), so use it to learn
+	// the object's size up front and decide whether/how to slice a Range
+	// *before* asking the backend for the body — that lets the backend
+	// stream a full-object GET directly rather than always materializing a
+	// local file first "just in case" a range was requested.
+	info, err := h.Backend.HeadObject(r.Context(), bucket, key)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeErrorCode(w, r, "NoSuchKey", "the specified key does not exist")
+			return
+		}
+		writeInternalError(w, r, err)
+		return
+	}
+
+	var rangeSpec *RangeSpec
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader != "" {
+		start, end, ok := parseRange(rangeHeader, info.Size)
+		if !ok {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size))
+			writeErrorCode(w, r, "InvalidArgument", "invalid Range header")
+			return
+		}
+		rangeSpec = &RangeSpec{Start: start, End: end}
+	}
+
+	body, _, err := h.Backend.GetObject(r.Context(), bucket, key, rangeSpec)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			writeErrorCode(w, r, "NoSuchKey", "the specified key does not exist")
@@ -25,31 +52,18 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 	w.Header().Set("Last-Modified", info.LastModified.UTC().Format(http.TimeFormat))
 	w.Header().Set("Accept-Ranges", "bytes")
 
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader == "" {
+	if rangeSpec == nil {
 		w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.Copy(w, body)
 		return
 	}
 
-	start, end, ok := parseRange(rangeHeader, info.Size)
-	if !ok {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size))
-		writeErrorCode(w, r, "InvalidArgument", "invalid Range header")
-		return
-	}
-
-	if _, err := body.Seek(start, io.SeekStart); err != nil {
-		writeInternalError(w, r, err)
-		return
-	}
-
-	length := end - start + 1
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, info.Size))
+	length := rangeSpec.End - rangeSpec.Start + 1
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeSpec.Start, rangeSpec.End, info.Size))
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.WriteHeader(http.StatusPartialContent)
-	_, _ = io.CopyN(w, body, length)
+	_, _ = io.Copy(w, body)
 }
 
 // parseRange parses a single-range "bytes=start-end" Range header value.

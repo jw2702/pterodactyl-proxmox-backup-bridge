@@ -26,13 +26,27 @@ management is a possible future enhancement, not implemented here.
 
 ## No true partial restore (Range requests)
 
-PBS's `restore` always produces the full archive file; there is no
-server-side partial-object fetch. The bridge implements HTTP Range requests
-by restoring the full snapshot to a scratch file and then serving the
-requested byte range from it ("restore-then-slice"). This is correct but not
-bandwidth-efficient for large backups if a client requests a small range —
-functionally equivalent to a real S3 Range GET from the client's
-perspective, just not lazy on the backend.
+A full (non-Range) `GetObject` streams directly from
+`proxmox-backup-client restore ... -` (stdout) straight into the HTTP
+response, with no local scratch file involved. This isn't just a disk-usage
+optimization: Wings' own restore handler blocks on receiving HTTP response
+headers from this request before it responds to Panel at all (the actual
+file restore only happens in the background afterwards), so any delay
+before the bridge can start writing a response directly inflates the
+Panel-visible request time and can trip Panel's own ~15s HTTP client
+timeout on large backups.
+
+Range requests are the exception: PBS's `restore` always produces the full
+archive file with no server-side partial-object fetch, and a live
+subprocess pipe can't be seeked. So a Range request still restores the full
+snapshot to a scratch file first and serves the requested byte range from
+it ("restore-then-slice"), same as before. This is correct but not
+bandwidth-efficient for large backups if a client requests a small range,
+and — since it's the same synchronous-before-headers pattern — could in
+principle hit the same Wings/Panel timeout for very large backups. In
+practice Wings' own S3 restore path (see above) always issues a full GET,
+never a Range request, so this only matters if some other client requests a
+specific range.
 
 ## Path-style addressing only
 

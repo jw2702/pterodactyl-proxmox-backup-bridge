@@ -136,39 +136,65 @@ func (b *Backend) PutObject(ctx context.Context, bucket, key string, body io.Rea
 	return b.commitObject(ctx, bucket, key, res.Path, res.Size, res.MD5)
 }
 
+// deletingFile wraps a local temp file, limiting reads to a byte range
+// (used for Range requests, which still need a seekable local copy) and
+// removing the underlying file on Close.
 type deletingFile struct {
-	*os.File
+	r    io.Reader
+	file *os.File
 	path string
 }
 
+func (d *deletingFile) Read(p []byte) (int, error) { return d.r.Read(p) }
+
 func (d *deletingFile) Close() error {
-	err := d.File.Close()
+	err := d.file.Close()
 	_ = os.Remove(d.path)
 	return err
 }
 
-func (b *Backend) GetObject(ctx context.Context, bucket, key string) (s3api.ReadSeekCloser, s3api.ObjectInfo, error) {
+func (b *Backend) GetObject(ctx context.Context, bucket, key string, rangeSpec *s3api.RangeSpec) (io.ReadCloser, s3api.ObjectInfo, error) {
 	mapping, err := b.Store.GetObjectMapping(bucket, key)
 	if err != nil {
 		return nil, s3api.ObjectInfo{}, mapNotFound(err)
 	}
+	info := s3api.ObjectInfo{Key: key, Size: mapping.Size, ETag: mapping.ETag, LastModified: mapping.UpdatedAt}
 
+	if rangeSpec == nil {
+		// Stream directly from proxmox-backup-client's stdout rather than
+		// buffering the whole object to local disk first: Wings blocks its
+		// own response to Panel on receiving HTTP response headers from
+		// this request, so time-to-first-byte here directly determines how
+		// long Panel waits before it can show the restore as "accepted".
+		rc, err := b.PBS.RestoreStream(ctx, mapping.PBSBackupType, mapping.PBSBackupID, time.Unix(mapping.PBSBackupTime, 0), mapping.Namespace)
+		if err != nil {
+			return nil, s3api.ObjectInfo{}, fmt.Errorf("backend: pbs restore stream failed: %w", err)
+		}
+		return rc, info, nil
+	}
+
+	// A specific byte range was requested. A live subprocess pipe can't be
+	// seeked, so fall back to restoring to a local file and slicing that -
+	// this is the pre-existing "restore-then-slice" behavior, now scoped to
+	// only the (rare, for backup restores) ranged-request case.
 	outPath, err := b.Stage.TempFilePath("gets", "get-*.tmp")
 	if err != nil {
 		return nil, s3api.ObjectInfo{}, err
 	}
-
 	if err := b.PBS.Restore(ctx, mapping.PBSBackupType, mapping.PBSBackupID, time.Unix(mapping.PBSBackupTime, 0), mapping.Namespace, outPath); err != nil {
 		return nil, s3api.ObjectInfo{}, fmt.Errorf("backend: pbs restore failed: %w", err)
 	}
-
 	f, err := os.Open(outPath)
 	if err != nil {
 		return nil, s3api.ObjectInfo{}, err
 	}
-
-	info := s3api.ObjectInfo{Key: key, Size: mapping.Size, ETag: mapping.ETag, LastModified: mapping.UpdatedAt}
-	return &deletingFile{File: f, path: outPath}, info, nil
+	if _, err := f.Seek(rangeSpec.Start, io.SeekStart); err != nil {
+		f.Close()
+		_ = os.Remove(outPath)
+		return nil, s3api.ObjectInfo{}, err
+	}
+	length := rangeSpec.End - rangeSpec.Start + 1
+	return &deletingFile{r: io.LimitReader(f, length), file: f, path: outPath}, info, nil
 }
 
 func (b *Backend) HeadObject(ctx context.Context, bucket, key string) (s3api.ObjectInfo, error) {

@@ -58,20 +58,25 @@ func (m *memBackend) PutObject(ctx context.Context, bucket, key string, body io.
 	return ObjectInfo{Key: key, Size: int64(len(data)), ETag: etag, LastModified: time.Now()}, nil
 }
 
-type memReadSeekCloser struct {
-	*bytes.Reader
+type memReadCloser struct {
+	io.Reader
 }
 
-func (memReadSeekCloser) Close() error { return nil }
+func (memReadCloser) Close() error { return nil }
 
-func (m *memBackend) GetObject(ctx context.Context, bucket, key string) (ReadSeekCloser, ObjectInfo, error) {
+func (m *memBackend) GetObject(ctx context.Context, bucket, key string, rangeSpec *RangeSpec) (io.ReadCloser, ObjectInfo, error) {
 	m.mu.Lock()
 	obj, ok := m.objects[objKey(bucket, key)]
 	m.mu.Unlock()
 	if !ok {
 		return nil, ObjectInfo{}, ErrNotFound
 	}
-	return memReadSeekCloser{bytes.NewReader(obj.data)}, ObjectInfo{Key: key, Size: int64(len(obj.data)), ETag: obj.etag, LastModified: obj.mod}, nil
+	info := ObjectInfo{Key: key, Size: int64(len(obj.data)), ETag: obj.etag, LastModified: obj.mod}
+	data := obj.data
+	if rangeSpec != nil {
+		data = data[rangeSpec.Start : rangeSpec.End+1]
+	}
+	return memReadCloser{bytes.NewReader(data)}, info, nil
 }
 
 func (m *memBackend) HeadObject(ctx context.Context, bucket, key string) (ObjectInfo, error) {

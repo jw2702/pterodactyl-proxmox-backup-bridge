@@ -2,6 +2,7 @@ package pbs
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -77,6 +78,55 @@ func TestBackupRestoreForget_RoundTrip(t *testing.T) {
 	err = c.Restore(ctx, "host", "mybackup", usedTime, "mybucket", out)
 	if err == nil {
 		t.Fatal("expected restore of forgotten snapshot to fail")
+	}
+}
+
+func TestRestoreStream_StreamsContent(t *testing.T) {
+	c, _ := newTestClient(t)
+	ctx := context.Background()
+
+	src := filepath.Join(t.TempDir(), "src.img")
+	want := "streamed backup archive contents"
+	if err := os.WriteFile(src, []byte(want), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	backupTime := time.Unix(1700000000, 0).UTC()
+	usedTime, err := c.Backup(ctx, src, "host", "streamtest", backupTime, "mybucket")
+	if err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+
+	rc, err := c.RestoreStream(ctx, "host", "streamtest", usedTime, "mybucket")
+	if err != nil {
+		t.Fatalf("RestoreStream: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("reading stream: %v", err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestRestoreStream_MissingSnapshotErrorsOnClose(t *testing.T) {
+	c, _ := newTestClient(t)
+	ctx := context.Background()
+
+	rc, err := c.RestoreStream(ctx, "host", "does-not-exist", time.Unix(1700000000, 0), "mybucket")
+	if err != nil {
+		// Some implementations might fail synchronously at Start(); either
+		// is acceptable as long as the caller gets an error.
+		return
+	}
+	_, readErr := io.ReadAll(rc)
+	closeErr := rc.Close()
+	if readErr == nil && closeErr == nil {
+		t.Fatal("expected an error reading or closing a stream for a nonexistent snapshot")
 	}
 }
 
