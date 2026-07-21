@@ -15,10 +15,14 @@ type ObjectInfo struct {
 	LastModified time.Time
 }
 
-// Part is a single part reported by a client in CompleteMultipartUpload.
+// Part is a single multipart-upload part: as reported by a client in
+// CompleteMultipartUpload (PartNumber+ETag only), or as returned by
+// ListParts (all fields populated).
 type Part struct {
-	PartNumber int
-	ETag       string
+	PartNumber   int
+	ETag         string
+	Size         int64
+	LastModified time.Time
 }
 
 // RangeSpec is an inclusive byte range requested via an HTTP Range header.
@@ -59,6 +63,11 @@ type Backend interface {
 
 	CreateMultipartUpload(ctx context.Context, bucket, key string) (uploadID string, err error)
 	UploadPart(ctx context.Context, bucket, key, uploadID string, partNumber int, body io.Reader) (etag string, err error)
+	// ListParts returns the parts already uploaded for an in-progress
+	// multipart upload. Pterodactyl Panel calls this when Wings reports a
+	// completed backup without including its own parts list (an officially
+	// supported, if uncommon, path per Panel's request validation).
+	ListParts(ctx context.Context, bucket, key, uploadID string) ([]Part, error)
 	CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts []Part) (ObjectInfo, error)
 	AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error
 }

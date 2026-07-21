@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -112,5 +113,27 @@ func TestChunkedReader_EmptyBody(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("expected empty body, got %q", got)
+	}
+}
+
+// TestChunkedReader_RejectsImplausibleChunkSize guards against a
+// malicious/malformed chunk header claiming an enormous size before its
+// signature can even be checked (the signature covers the chunk data, only
+// verifiable after reading it) — without a bound, this would attempt to
+// allocate that many bytes up front and could crash the process.
+func TestChunkedReader_RejectsImplausibleChunkSize(t *testing.T) {
+	secretKey := "bridgesecret"
+	scope := credentialScope{AccessKey: "bridgekey", Date: "20260721", Region: "us-east-1", Service: "s3"}
+	amzDate := "20260721T120000Z"
+	seedSig := "seedsignatureplaceholder0000000000000000000000000000000000000"
+
+	// A syntactically valid chunk header claiming an implausible size; its
+	// signature is irrelevant since the size bound must reject it first.
+	body := "7fffffffffffffff;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n"
+
+	cr := NewChunkedReader(strings.NewReader(body), secretKey, scope, amzDate, seedSig)
+	_, err := io.ReadAll(cr)
+	if err == nil {
+		t.Fatal("expected an error for an implausibly large declared chunk size")
 	}
 }

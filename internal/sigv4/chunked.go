@@ -11,6 +11,12 @@ import (
 
 var emptyPayloadHash = hashHex("")
 
+// maxChunkSize bounds a single aws-chunked chunk's declared size. AWS SDKs
+// default to chunks far smaller than this (typically a few MB); this exists
+// purely to reject an implausible/malicious claimed size before allocating a
+// buffer for it, not to constrain legitimate traffic.
+const maxChunkSize = 256 << 20 // 256 MiB
+
 // ChunkedReader decodes an aws-chunked (STREAMING-AWS4-HMAC-SHA256-PAYLOAD)
 // request body, verifying each chunk's signature against the chain seeded by
 // the request's own Authorization-header signature, and yields the decoded
@@ -96,6 +102,14 @@ func (c *ChunkedReader) nextChunk() error {
 	size, err := strconv.ParseInt(head[0], 16, 64)
 	if err != nil {
 		return fmt.Errorf("sigv4: chunked: invalid chunk size %q: %w", head[0], err)
+	}
+	if size < 0 || size > maxChunkSize {
+		// The chunk-size header is attacker-controlled input read before its
+		// signature can be checked (the signature covers the chunk's data,
+		// verified only after it's read) — without this bound, a claimed
+		// size near int64 max would make the next line allocate a
+		// multi-exabyte slice and crash the process.
+		return fmt.Errorf("sigv4: chunked: chunk size %d exceeds maximum of %d bytes", size, maxChunkSize)
 	}
 
 	var chunkSig string

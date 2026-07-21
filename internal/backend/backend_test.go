@@ -258,6 +258,76 @@ func TestMultipartUploadLifecycle(t *testing.T) {
 	}
 }
 
+// TestListParts_MatchesUploadedPartsForPanelFallback mirrors Panel's own
+// fallback path: if Wings reports a completed backup without its own parts
+// list (officially allowed per Panel's request validation, "parts" is
+// nullable), Panel calls S3 ListParts itself to build the part list before
+// calling CompleteMultipartUpload.
+func TestListParts_MatchesUploadedPartsForPanelFallback(t *testing.T) {
+	b := newTestBackend(t)
+	ctx := context.Background()
+
+	uploadID, err := b.CreateMultipartUpload(ctx, "mybucket", "listparts-test.tar.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	partData := [][]byte{
+		bytes.Repeat([]byte("A"), 5),
+		bytes.Repeat([]byte("B"), 3),
+	}
+	var uploadedETags []string
+	for i, pd := range partData {
+		etag, err := b.UploadPart(ctx, "mybucket", "listparts-test.tar.gz", uploadID, i+1, bytes.NewReader(pd))
+		if err != nil {
+			t.Fatalf("UploadPart %d: %v", i+1, err)
+		}
+		uploadedETags = append(uploadedETags, etag)
+	}
+
+	listed, err := b.ListParts(ctx, "mybucket", "listparts-test.tar.gz", uploadID)
+	if err != nil {
+		t.Fatalf("ListParts: %v", err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("expected 2 parts, got %d", len(listed))
+	}
+	for i, p := range listed {
+		if p.PartNumber != i+1 {
+			t.Fatalf("part %d out of order: %+v", i, listed)
+		}
+		if p.ETag != uploadedETags[i] {
+			t.Fatalf("part %d ETag = %q, want %q", i+1, p.ETag, uploadedETags[i])
+		}
+		if p.Size != int64(len(partData[i])) {
+			t.Fatalf("part %d size = %d, want %d", i+1, p.Size, len(partData[i]))
+		}
+	}
+
+	// Exactly what Panel does: use ListParts' output to drive
+	// CompleteMultipartUpload.
+	var completeParts []s3api.Part
+	for _, p := range listed {
+		completeParts = append(completeParts, s3api.Part{PartNumber: p.PartNumber, ETag: p.ETag})
+	}
+	info, err := b.CompleteMultipartUpload(ctx, "mybucket", "listparts-test.tar.gz", uploadID, completeParts)
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload using ListParts output: %v", err)
+	}
+	if info.Size != int64(len(partData[0])+len(partData[1])) {
+		t.Fatalf("size = %d", info.Size)
+	}
+}
+
+func TestListParts_NonexistentUpload(t *testing.T) {
+	b := newTestBackend(t)
+	ctx := context.Background()
+	_, err := b.ListParts(ctx, "mybucket", "key", "no-such-upload")
+	if err != s3api.ErrNotFound {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
 // TestCompleteMultipartUpload_RetryAfterTransientPBSFailure mirrors what
 // actually happens in production: Panel's AWS SDK client automatically
 // retries a failed CompleteMultipartUpload call with the same upload ID (no

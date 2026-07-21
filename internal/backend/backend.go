@@ -338,6 +338,28 @@ func (b *Backend) UploadPart(ctx context.Context, bucket, key, uploadID string, 
 	return res.MD5, nil
 }
 
+func (b *Backend) ListParts(ctx context.Context, bucket, key, uploadID string) ([]s3api.Part, error) {
+	if _, err := b.Store.GetUpload(uploadID); err != nil {
+		return nil, mapNotFound(err)
+	}
+
+	stored, err := b.Store.ListParts(uploadID)
+	if err != nil {
+		return nil, err
+	}
+
+	parts := make([]s3api.Part, len(stored))
+	for i, p := range stored {
+		parts[i] = s3api.Part{
+			PartNumber:   p.PartNumber,
+			ETag:         p.ETag,
+			Size:         p.Size,
+			LastModified: p.UploadedAt,
+		}
+	}
+	return parts, nil
+}
+
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts []s3api.Part) (s3api.ObjectInfo, error) {
 	upload, err := b.Store.GetUpload(uploadID)
 	if err != nil {

@@ -244,6 +244,77 @@ func TestMultipartUploadLifecycle(t *testing.T) {
 	}
 }
 
+// TestListParts_HTTPLevel mirrors Panel calling S3's ListParts operation
+// (GET .../{key}?uploadId={id}) — its fallback path when Wings reports a
+// completed backup without its own parts list.
+func TestListParts_HTTPLevel(t *testing.T) {
+	srv, signer, _ := newTestServer(t)
+
+	createReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/mybucket/listparts.tar.gz?uploads", nil)
+	if err := signer.SignHeader(createReq); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var createResult initiateMultipartUploadResult
+	if err := xml.NewDecoder(resp.Body).Decode(&createResult); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	partsData := [][]byte{bytes.Repeat([]byte("X"), 4), bytes.Repeat([]byte("Y"), 6)}
+	var uploadedETags []string
+	for i, pd := range partsData {
+		partNum := i + 1
+		url := srv.URL + "/mybucket/listparts.tar.gz?partNumber=" + itoaTest(partNum) + "&uploadId=" + createResult.UploadID
+		req, _ := http.NewRequest(http.MethodPut, url, bytes.NewReader(pd))
+		if err := signer.SignHeader(req); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uploadedETags = append(uploadedETags, resp.Header.Get("ETag"))
+		resp.Body.Close()
+	}
+
+	listReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/mybucket/listparts.tar.gz?uploadId="+createResult.UploadID, nil)
+	if err := signer.SignHeader(listReq); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = http.DefaultClient.Do(listReq)
+	if err != nil {
+		t.Fatalf("ListParts request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("ListParts status = %d, body=%s", resp.StatusCode, b)
+	}
+	var listResult listPartsResult
+	if err := xml.NewDecoder(resp.Body).Decode(&listResult); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if len(listResult.Parts) != 2 {
+		t.Fatalf("expected 2 parts, got %d: %+v", len(listResult.Parts), listResult.Parts)
+	}
+	for i, p := range listResult.Parts {
+		if p.PartNumber != i+1 {
+			t.Fatalf("part %d out of order: %+v", i, listResult.Parts)
+		}
+		if p.ETag != uploadedETags[i] {
+			t.Fatalf("part %d ETag = %q, want %q", i+1, p.ETag, uploadedETags[i])
+		}
+		if p.Size != int64(len(partsData[i])) {
+			t.Fatalf("part %d size = %d, want %d", i+1, p.Size, len(partsData[i]))
+		}
+	}
+}
+
 func TestAbortMultipartUpload(t *testing.T) {
 	srv, signer, backend := newTestServer(t)
 

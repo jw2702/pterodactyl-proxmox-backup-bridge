@@ -65,6 +65,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleCompleteMultipartUpload(w, r, bucket, key)
 	case r.Method == http.MethodDelete && hasUploadID && key != "":
 		h.handleAbortMultipartUpload(w, r, bucket, key)
+	case r.Method == http.MethodGet && hasUploadID && key != "":
+		h.handleListParts(w, r, bucket, key)
 	case r.Method == http.MethodGet && key == "" && hasListType:
 		h.handleListObjectsV2(w, r, bucket)
 	case r.Method == http.MethodPut && key != "":

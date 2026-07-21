@@ -55,6 +55,26 @@ implement virtual-hosted-style addressing (`{bucket}.host/{key}`). Pterodactyl
 Panel's S3 disk config must have path-style addressing enabled
 (`AWS_USE_PATH_STYLE_ENDPOINT=true`).
 
+## No transport encryption (bridge itself doesn't do TLS)
+
+The bridge speaks plain HTTP; SigV4 authenticates and integrity-protects
+requests but does not encrypt them. See the "Network / transport security"
+section in README.md for the recommended mitigation (private network, or a
+TLS-terminating reverse proxy in front of the bridge).
+
+## Internal error details are not returned to clients
+
+`InternalError` (HTTP 500) responses only ever contain a generic message
+plus the request ID — the actual error detail (PBS stderr, internal file
+paths, etc.) is logged server-side only (`docker logs`/the bridge's own
+structured logs), keyed by that same request ID. This is deliberate: some
+`GetObject` requests are reachable via presigned URLs handed to end users
+for direct backup downloads (not just Wings/Panel), so internal details
+must not leak into a response body an end user could see. The practical
+consequence: troubleshooting a `500` now requires the bridge's own logs,
+not just Panel's Laravel log — grep the bridge's logs for the request ID
+shown in Panel's error message/log entry.
+
 ## Single static credential pair
 
 The bridge authenticates all callers against one configured
@@ -77,14 +97,26 @@ deliberate choice to keep S3 semantics simple (the client gets a definitive
 success/failure for the upload) rather than introducing an async
 "upload accepted, still processing" state that S3 doesn't have.
 
-## ListObjectsV2 is a secondary feature, not battle-tested against Panel
+## Operations confirmed against Pterodactyl's actual source, vs. implemented for general S3 completeness
 
-`ListObjectsV2` is implemented (delimiter/common-prefix grouping over the
-bbolt mapping) but Pterodactyl Panel's actual usage of it (if any) wasn't
-confirmed against this bridge's implementation specifically — it exists for
-completeness/robustness and passes its own unit tests, but treat it as lower
-confidence than Put/Get/Head/Delete/Multipart, which mirror Panel/Wings'
-confirmed usage patterns.
+Verified directly against the Panel and Wings source (not just assumed):
+Panel calls `CreateMultipartUpload`, `UploadPart` URLs (presigned, consumed
+by Wings), `AbortMultipartUpload` (on a failed backup report),
+`CompleteMultipartUpload`, `ListParts` (Panel's own fallback if Wings
+reports a completed backup without its own parts list — `parts` is
+`nullable` in Panel's request validation), `DeleteObject`, and a presigned
+`GetObject` (used by both Wings for restore and, separately, for direct
+end-user backup downloads). All of these are implemented and covered by
+tests mirroring Panel/Wings' exact request shapes.
+
+Pterodactyl **never** calls single-shot `PutObject` (every backup, even a
+1-byte one, goes through `CreateMultipartUpload` with at least one part),
+`HeadObject`, or `ListObjectsV2` — these three are implemented for general
+S3-compatibility/debugging convenience (e.g. testing with `aws-cli`) rather
+than because Pterodactyl needs them. They're simple, low-risk, and
+independently tested, so there's little reason to remove them, but treat
+them as "nice to have" rather than load-bearing, and they're the first
+place to look if you ever want to trim the surface further.
 
 ## Testing without a real PBS server
 

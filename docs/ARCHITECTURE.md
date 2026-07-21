@@ -99,8 +99,10 @@ on `Close`.
 `CompleteMultipartUpload` validates the client's claimed part list against
 what was actually stored (order, existence, ETag match), concatenates the
 parts into one file, and runs the same commit path as a single-shot
-`PutObject`. `AbortMultipartUpload` and the background GC both just remove
-the scratch directory and bbolt record.
+`PutObject`. `ListParts` reads the same stored part records back out
+(Panel calls this itself, instead of supplying its own part list, whenever
+Wings reports a completed backup without one). `AbortMultipartUpload` and
+the background GC both just remove the scratch directory and bbolt record.
 
 ## Verified against the real PBS client
 

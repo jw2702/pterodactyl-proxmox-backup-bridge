@@ -54,13 +54,17 @@ func writeAuthError(w http.ResponseWriter, r *http.Request, err *sigv4.AuthError
 }
 
 func writeInternalError(w http.ResponseWriter, r *http.Request, err error) {
-	// The error text is also returned to the client in the XML Message
-	// field (so it surfaces in Panel's own logs via the S3 SDK exception),
-	// but log it server-side too so it's visible without needing to dig
-	// through Panel's logs.
+	// Full error detail (PBS stderr, internal paths, etc.) is logged
+	// server-side only, keyed by request ID. The client only ever sees a
+	// generic message plus that request ID for correlation — some GetObject
+	// requests are reachable via presigned URLs handed to end users (direct
+	// backup downloads, not just Wings/Panel), so internal details must not
+	// leak into the response body. Debugging now requires the bridge's own
+	// logs rather than Panel's Laravel log.
+	reqID := requestID(r)
 	slog.Default().Error("internal error handling S3 request",
-		"method", r.Method, "path", r.URL.Path, "request_id", requestID(r), "error", err)
-	writeErrorCode(w, r, "InternalError", err.Error())
+		"method", r.Method, "path", r.URL.Path, "request_id", reqID, "error", err)
+	writeErrorCode(w, r, "InternalError", "an internal error occurred; see bridge server logs for request_id "+reqID)
 }
 
 func requestID(r *http.Request) string {

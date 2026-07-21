@@ -5,8 +5,6 @@ import (
 	"net/http"
 )
 
-const s3Namespace = "http://s3.amazonaws.com/doc/2006-03-01/"
-
 type initiateMultipartUploadResult struct {
 	XMLName  xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ InitiateMultipartUploadResult"`
 	Bucket   string   `xml:"Bucket"`

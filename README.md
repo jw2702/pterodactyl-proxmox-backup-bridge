@@ -94,6 +94,23 @@ backup/restore/delete; it deliberately does **not** include
 modifies datastore structure itself. Do not grant `DatastoreAdmin` — it's
 broader than necessary.
 
+## Network / transport security
+
+The bridge does not terminate TLS itself — it speaks plain HTTP. AWS
+Signature V4 covers *authentication and integrity* (a request can't be
+forged or tampered with without the shared secret key), but it does **not**
+provide *confidentiality*: the Authorization header/presigned-URL
+signature, and the full backup contents themselves, are visible to anyone
+who can observe the network path in plaintext.
+
+**Recommended setup**: Panel, Wings, and the bridge should communicate only
+over internal/private IP addresses that aren't reachable from outside your
+trusted network. If that isn't possible for your deployment (e.g. the
+bridge must be reached across a network segment you don't fully trust),
+put a TLS-terminating reverse proxy (nginx, Caddy, Traefik, …) in front of
+it and point `AWS_ENDPOINT` at the proxy's `https://` URL instead of the
+bridge directly.
+
 ## Running
 
 ### Docker (recommended)

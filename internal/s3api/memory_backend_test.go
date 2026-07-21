@@ -155,6 +155,26 @@ func (m *memBackend) UploadPart(ctx context.Context, bucket, key, uploadID strin
 	return md5Hex(data), nil
 }
 
+func (m *memBackend) ListParts(ctx context.Context, bucket, key, uploadID string) ([]Part, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.uploads[uploadID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	numbers := make([]int, 0, len(u.parts))
+	for n := range u.parts {
+		numbers = append(numbers, n)
+	}
+	sort.Ints(numbers)
+	parts := make([]Part, len(numbers))
+	for i, n := range numbers {
+		data := u.parts[n]
+		parts[i] = Part{PartNumber: n, ETag: md5Hex(data), Size: int64(len(data)), LastModified: time.Now()}
+	}
+	return parts, nil
+}
+
 func (m *memBackend) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts []Part) (ObjectInfo, error) {
 	m.mu.Lock()
 	u, ok := m.uploads[uploadID]
