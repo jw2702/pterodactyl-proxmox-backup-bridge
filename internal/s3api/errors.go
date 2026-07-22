@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/pterodactyl-proxmox-backup-bridge/bridge/internal/logging"
 	"github.com/pterodactyl-proxmox-backup-bridge/bridge/internal/sigv4"
 )
 
@@ -68,8 +69,5 @@ func writeInternalError(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 func requestID(r *http.Request) string {
-	if v, ok := r.Context().Value(requestIDKey).(string); ok {
-		return v
-	}
-	return ""
+	return logging.RequestIDFromContext(r.Context())
 }

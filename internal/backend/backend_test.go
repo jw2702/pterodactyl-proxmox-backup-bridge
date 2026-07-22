@@ -3,13 +3,20 @@ package backend
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/pterodactyl-proxmox-backup-bridge/bridge/internal/logging"
 	"github.com/pterodactyl-proxmox-backup-bridge/bridge/internal/pbs"
 	"github.com/pterodactyl-proxmox-backup-bridge/bridge/internal/s3api"
 	"github.com/pterodactyl-proxmox-backup-bridge/bridge/internal/stage"
@@ -328,15 +335,301 @@ func TestListParts_NonexistentUpload(t *testing.T) {
 	}
 }
 
+// TestPutObject_TransientRetryLogsCarryRequestID proves the request ID set
+// by internal/s3api on an incoming HTTP request actually reaches
+// internal/pbs's retry log lines end-to-end, through backend.Backend, not
+// just that the plumbing compiles. internal/pbs has no notion of an HTTP
+// request of its own, so without this the request ID that ties a bridge log
+// line back to a specific Panel/Wings call would silently stop at the
+// backend boundary.
+func TestPutObject_TransientRetryLogsCarryRequestID(t *testing.T) {
+	b := newTestBackend(t)
+	t.Setenv("STUB_FORCE_BACKUP_FAIL_COUNT", "1")
+
+	var logBuf bytes.Buffer
+	prevDefault := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prevDefault) })
+
+	ctx := logging.WithRequestID(context.Background(), "test-request-id-xyz")
+	if _, err := b.PutObject(ctx, "mybucket", "req-id-key", bytes.NewReader([]byte("data"))); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "transient error, retrying") {
+		t.Fatalf("expected a transient-retry log line, got: %s", logged)
+	}
+	if !strings.Contains(logged, "test-request-id-xyz") {
+		t.Fatalf("expected the retry log line to carry the request ID, got: %s", logged)
+	}
+}
+
+// TestPutObject_ConcurrentBackupsForSameServerAreSerializedAtPBSLevel guards
+// the fix for a real concurrency bug: two different backups for the same
+// server (same PBS group, different S3 keys — commitObject only locks per
+// (bucket,key), not per group) could both call pbs.Client.Backup at the same
+// time. Each has its own backup-time-collision retry loop, so in the worst
+// case both could repeatedly bump into each other and exhaust their
+// retries. groupLockKey serializes the actual PBS.Backup call per group, so
+// at most one is ever in flight for a given server — this test proves that
+// directly by making each "backup" invocation take a deliberate 150ms (via
+// the stub's STUB_BACKUP_DELAY_MS) and checking, from timestamped
+// start/end markers, that no two invocations for the same group ever
+// overlap despite being kicked off truly concurrently.
+func TestPutObject_ConcurrentBackupsForSameServerAreSerializedAtPBSLevel(t *testing.T) {
+	b := newTestBackend(t)
+	timingFile := filepath.Join(t.TempDir(), "timing.log")
+	t.Setenv("STUB_BACKUP_DELAY_MS", "150")
+	t.Setenv("STUB_BACKUP_TIMING_FILE", timingFile)
+	ctx := context.Background()
+
+	const serverUUID = "shared-server-uuid"
+	const n = 5
+
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("%s/backup-%d.tar.gz", serverUUID, i)
+			_, err := b.PutObject(ctx, "mybucket", key, bytes.NewReader([]byte(fmt.Sprintf("backup %d contents", i))))
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("PutObject %d: %v", i, err)
+		}
+	}
+
+	data, err := os.ReadFile(timingFile)
+	if err != nil {
+		t.Fatalf("reading timing file: %v", err)
+	}
+	assertNoOverlappingIntervals(t, string(data))
+}
+
+// assertNoOverlappingIntervals parses "START <group> <epoch_ns>"/"END
+// <group> <epoch_ns>" lines (see scripts/stub-proxmox-backup-client) and
+// fails the test if any two intervals for the same group overlap.
+func assertNoOverlappingIntervals(t *testing.T, log string) {
+	t.Helper()
+
+	type interval struct{ start, end int64 }
+	byGroup := map[string]map[int64]int64{} // group -> start -> end, paired up below
+	starts := map[string][]int64{}
+
+	for _, line := range strings.Split(strings.TrimSpace(log), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			t.Fatalf("malformed timing line: %q", line)
+		}
+		kind, group, tsStr := fields[0], fields[1], fields[2]
+		ts, err := strconv.ParseInt(tsStr, 10, 64)
+		if err != nil {
+			t.Fatalf("parsing timestamp in %q: %v", line, err)
+		}
+		if byGroup[group] == nil {
+			byGroup[group] = map[int64]int64{}
+		}
+		switch kind {
+		case "START":
+			starts[group] = append(starts[group], ts)
+		case "END":
+			// Pair with the earliest still-unpaired start for this group.
+			ss := starts[group]
+			if len(ss) == 0 {
+				t.Fatalf("END with no matching START for group %s", group)
+			}
+			s := ss[0]
+			starts[group] = ss[1:]
+			byGroup[group][s] = ts
+		default:
+			t.Fatalf("unexpected line kind %q", kind)
+		}
+	}
+
+	for group, se := range byGroup {
+		var intervals []interval
+		for s, e := range se {
+			intervals = append(intervals, interval{s, e})
+		}
+		sort.Slice(intervals, func(i, j int) bool { return intervals[i].start < intervals[j].start })
+		for i := 1; i < len(intervals); i++ {
+			if intervals[i].start < intervals[i-1].end {
+				t.Fatalf("group %s: overlapping PBS.Backup calls: [%d,%d] and [%d,%d]",
+					group, intervals[i-1].start, intervals[i-1].end, intervals[i].start, intervals[i].end)
+			}
+		}
+	}
+}
+
+// TestMultipart_ConcurrentUploadPartAndAbortNeverLeaveSplitState guards the
+// fix for a real concurrency bug: DeleteObject/AbortMultipartUpload used to
+// take no lock at all, so a concurrent UploadPart on the same in-progress
+// upload could race against RemoveUploadDir + DeleteUpload — e.g. writing a
+// part file into a directory being concurrently os.RemoveAll'd, or
+// registering a part in bbolt for an upload record that was just deleted.
+// Panel's "delete backup" action issuing DeleteObject on a still-in-progress
+// backup while Wings is mid-upload is exactly this scenario in production
+// (see abortMatchingUploads).
+//
+// Both operations now share the (bucket,key) lock CreateMultipartUpload,
+// UploadPart, AbortMultipartUpload and CompleteMultipartUpload all take, so
+// regardless of which one wins the race, the result must be consistent:
+// the upload's bbolt record and its scratch directory must always agree on
+// whether the upload still exists — never one present without the other.
+func TestMultipart_ConcurrentUploadPartAndAbortNeverLeaveSplitState(t *testing.T) {
+	b := newTestBackend(t)
+	ctx := context.Background()
+
+	for i := 0; i < 20; i++ {
+		uploadID, err := b.CreateMultipartUpload(ctx, "mybucket", "racy-key")
+		if err != nil {
+			t.Fatalf("CreateMultipartUpload: %v", err)
+		}
+		if _, err := b.UploadPart(ctx, "mybucket", "racy-key", uploadID, 1, bytes.NewReader([]byte("part one"))); err != nil {
+			t.Fatalf("seed UploadPart: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := b.UploadPart(ctx, "mybucket", "racy-key", uploadID, 2, bytes.NewReader([]byte("part two")))
+			if err != nil && err != s3api.ErrNotFound {
+				t.Errorf("iteration %d: UploadPart returned unexpected error: %v", i, err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			if err := b.AbortMultipartUpload(ctx, "mybucket", "racy-key", uploadID); err != nil && err != s3api.ErrNotFound {
+				t.Errorf("iteration %d: AbortMultipartUpload returned unexpected error: %v", i, err)
+			}
+		}()
+		close(start)
+		wg.Wait()
+
+		_, getErr := b.Store.GetUpload(uploadID)
+		recordExists := getErr == nil
+		_, statErr := os.Stat(b.Stage.UploadDir(uploadID))
+		dirExists := statErr == nil
+
+		if recordExists != dirExists {
+			t.Fatalf("iteration %d: split state — bbolt record exists=%v, scratch dir exists=%v", i, recordExists, dirExists)
+		}
+
+		// Clean up whichever state won, so the next iteration starts fresh.
+		if recordExists {
+			if err := b.AbortMultipartUpload(ctx, "mybucket", "racy-key", uploadID); err != nil {
+				t.Fatalf("iteration %d: cleanup abort: %v", i, err)
+			}
+		}
+	}
+}
+
+// TestOverwrite_OldSnapshotSurvivesStoreFailure guards the fix for a real
+// ordering bug: commitObject used to forget the old snapshot in PBS *before*
+// durably writing the new mapping to bbolt, so a store failure after the
+// forget left the key pointing at a just-deleted snapshot instead of the
+// documented "key always has a valid backing snapshot" guarantee. The fix
+// writes the new mapping first and only forgets the old snapshot afterwards.
+//
+// To reproduce exactly the failure shape the fix cares about — the
+// GetObjectMapping read succeeding but the later PutObjectMapping write
+// failing — the store is swapped for a read-only-reopened handle on the
+// same bbolt file (store.OpenReadOnly) partway through the test: reads keep
+// working, writes start failing, precisely mirroring e.g. a full disk that
+// only breaks writes.
+func TestOverwrite_OldSnapshotSurvivesStoreFailure(t *testing.T) {
+	t.Setenv("STUB_PBS_STATE_DIR", filepath.Join(t.TempDir(), "pbs-state"))
+	dbPath := filepath.Join(t.TempDir(), "bridge.db")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	stg, err := stage.New(filepath.Join(t.TempDir(), "scratch"))
+	if err != nil {
+		t.Fatalf("stage.New: %v", err)
+	}
+	client := &pbs.Client{
+		Repository: "test@pbs:store1",
+		Password:   "testpass",
+		BinPath:    stubBinPath(t),
+		Timeout:    10 * time.Second,
+	}
+	b := New(db, stg, client, "host", nil)
+	ctx := context.Background()
+
+	if _, err := b.PutObject(ctx, "mybucket", "samekey", bytes.NewReader([]byte("version one"))); err != nil {
+		t.Fatalf("first PutObject: %v", err)
+	}
+	firstMapping, err := b.Store.GetObjectMapping("mybucket", "samekey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure the second backup gets a distinct backup-time from the first
+	// (the stub keys snapshots by unix-second granularity and, unlike real
+	// PBS, doesn't organically detect same-timestamp collisions).
+	time.Sleep(1100 * time.Millisecond)
+
+	if err := b.Store.Close(); err != nil {
+		t.Fatalf("closing store: %v", err)
+	}
+	roStore, err := store.OpenReadOnly(dbPath)
+	if err != nil {
+		t.Fatalf("reopening store read-only: %v", err)
+	}
+	t.Cleanup(func() { roStore.Close() })
+	b.Store = roStore
+
+	if _, err := b.PutObject(ctx, "mybucket", "samekey", bytes.NewReader([]byte("version two"))); err == nil {
+		t.Fatal("expected second PutObject to fail against a read-only store")
+	}
+
+	// The old snapshot must still be intact: if Forget had been reached
+	// despite the failed mapping write, this restore would fail.
+	out := filepath.Join(t.TempDir(), "out")
+	if err := b.PBS.Restore(ctx, firstMapping.PBSBackupType, firstMapping.PBSBackupID, time.Unix(firstMapping.PBSBackupTime, 0), firstMapping.Namespace, out); err != nil {
+		t.Fatalf("expected old snapshot to survive a failed overwrite, but it's gone: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "version one" {
+		t.Fatalf("old snapshot content = %q, want %q", got, "version one")
+	}
+}
+
 // TestCompleteMultipartUpload_RetryAfterTransientPBSFailure mirrors what
 // actually happens in production: Panel's AWS SDK client automatically
 // retries a failed CompleteMultipartUpload call with the same upload ID (no
 // re-upload of parts). The backend must be able to satisfy that retry using
 // the already-concatenated final file, since the original parts are deleted
 // as soon as they're consumed during concatenation.
+//
+// The failure count must exceed pbs.MaxTransientRetries: fewer failures
+// than that would now be absorbed transparently by pbs.Client's own
+// transient-retry loop (see runWithRetry in internal/pbs/client.go), so this
+// test's single CompleteMultipartUpload call would succeed on the first try
+// instead of exercising the Panel-level retry safety net it's meant to
+// cover.
 func TestCompleteMultipartUpload_RetryAfterTransientPBSFailure(t *testing.T) {
 	b := newTestBackend(t)
-	t.Setenv("STUB_FORCE_BACKUP_FAIL_COUNT", "1")
+	t.Setenv("STUB_FORCE_BACKUP_FAIL_COUNT", strconv.Itoa(pbs.MaxTransientRetries))
 	ctx := context.Background()
 
 	uploadID, err := b.CreateMultipartUpload(ctx, "mybucket", "retry-test.tar.gz")

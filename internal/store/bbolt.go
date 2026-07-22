@@ -60,6 +60,20 @@ func (db *DB) Close() error {
 	return db.bolt.Close()
 }
 
+// OpenReadOnly opens an existing bbolt database at path without creating it
+// or its buckets, and without permitting writes — any Update-based call
+// (PutObjectMapping, DeleteObjectMapping, CreateUpload, ...) returns an
+// error against the DB this returns, while reads keep working normally.
+// Used by tests that need to simulate a store whose writes start failing
+// partway through a sequence of calls (see backend_test.go).
+func OpenReadOnly(path string) (*DB, error) {
+	bdb, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second, ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("store: opening bbolt db at %s (read-only): %w", path, err)
+	}
+	return &DB{bolt: bdb}, nil
+}
+
 // objectMapKey builds the composite bbolt key for an object mapping,
 // separating bucket and key with a NUL byte to avoid ambiguity (S3 bucket
 // names cannot contain NUL, unlike keys).

@@ -9,10 +9,30 @@
 # their values), so tests can assert on what the bridge actually invoked.
 #
 # Supported failure injection:
-#   STUB_FORCE_COLLISION_COUNT=N   the next N "backup" calls for a given
-#                                   (type,id) group fail with a
-#                                   backup-time-collision-shaped error before
-#                                   succeeding, to exercise the retry loop.
+#   STUB_FORCE_COLLISION_COUNT=N     the next N "backup" calls for a given
+#                                     (type,id) group fail with a
+#                                     backup-time-collision-shaped error before
+#                                     succeeding, to exercise the retry loop.
+#   STUB_FORCE_BACKUP_FAIL_COUNT=N   the next N "backup" calls for a given
+#                                     (type,id) group fail with a
+#                                     transient-shaped error before succeeding.
+#   STUB_FORCE_RESTORE_FAIL_COUNT=N  the next N "restore" calls for a given
+#                                     snapshot fail with a transient-shaped
+#                                     error (before any output is written)
+#                                     before succeeding.
+#   STUB_FORCE_FORGET_FAIL_COUNT=N   the next N "forget" calls for a given
+#                                     snapshot fail with a transient-shaped
+#                                     error before succeeding.
+#   STUB_BACKUP_DELAY_MS=N           every "backup" call sleeps N ms before
+#                                     writing the snapshot, widening the race
+#                                     window for concurrency tests.
+#   STUB_BACKUP_TIMING_FILE=path     if set (together with the delay above),
+#                                     every "backup" call appends
+#                                     "START <type>/<id> <epoch_ns>" right
+#                                     before the sleep and
+#                                     "END <type>/<id> <epoch_ns>" right
+#                                     after, so a test can verify two calls
+#                                     for the same group never overlap.
 
 set -euo pipefail
 
@@ -111,6 +131,16 @@ case "$cmd" in
       exit 1
     fi
 
+    if [ -n "${STUB_BACKUP_DELAY_MS:-}" ]; then
+      if [ -n "${STUB_BACKUP_TIMING_FILE:-}" ]; then
+        printf 'START %s/%s %s\n' "$backup_type" "$backup_id" "$(date +%s%N)" >> "$STUB_BACKUP_TIMING_FILE"
+      fi
+      sleep "$(awk "BEGIN { print $STUB_BACKUP_DELAY_MS / 1000 }")"
+      if [ -n "${STUB_BACKUP_TIMING_FILE:-}" ]; then
+        printf 'END %s/%s %s\n' "$backup_type" "$backup_id" "$(date +%s%N)" >> "$STUB_BACKUP_TIMING_FILE"
+      fi
+    fi
+
     snap_dir="$group_dir/$backup_time"
     mkdir -p "$snap_dir"
     cp "$src_path" "$snap_dir/$archive_name"
@@ -127,6 +157,21 @@ case "$cmd" in
     backup_time=$(date -u -d "$backup_time_rfc" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$backup_time_rfc" +%s)
 
     snap_dir="$(ns_dir "$ns")/$backup_type/$backup_id/$backup_time"
+    mkdir -p "$snap_dir"
+    fail_marker="$snap_dir/.restore-fail-count"
+    fail_remaining=0
+    if [ -f "$fail_marker" ]; then
+      fail_remaining=$(cat "$fail_marker")
+    elif [ -n "${STUB_FORCE_RESTORE_FAIL_COUNT:-}" ] && [ ! -f "$snap_dir/.restore-fail-initialized" ]; then
+      fail_remaining="$STUB_FORCE_RESTORE_FAIL_COUNT"
+      touch "$snap_dir/.restore-fail-initialized"
+    fi
+    if [ "$fail_remaining" -gt 0 ] 2>/dev/null; then
+      echo $((fail_remaining - 1)) > "$fail_marker"
+      echo "error: simulated transient failure" >&2
+      exit 1
+    fi
+
     if [ ! -f "$snap_dir/$archive_name" ]; then
       echo "error: no such snapshot $snapshot" >&2
       exit 1
@@ -144,6 +189,21 @@ case "$cmd" in
     IFS='/' read -r backup_type backup_id backup_time_rfc <<< "$snapshot"
     backup_time=$(date -u -d "$backup_time_rfc" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$backup_time_rfc" +%s)
     snap_dir="$(ns_dir "$ns")/$backup_type/$backup_id/$backup_time"
+    if [ -d "$snap_dir" ]; then
+      fail_marker="$snap_dir/.forget-fail-count"
+      fail_remaining=0
+      if [ -f "$fail_marker" ]; then
+        fail_remaining=$(cat "$fail_marker")
+      elif [ -n "${STUB_FORCE_FORGET_FAIL_COUNT:-}" ] && [ ! -f "$snap_dir/.forget-fail-initialized" ]; then
+        fail_remaining="$STUB_FORCE_FORGET_FAIL_COUNT"
+        touch "$snap_dir/.forget-fail-initialized"
+      fi
+      if [ "$fail_remaining" -gt 0 ] 2>/dev/null; then
+        echo $((fail_remaining - 1)) > "$fail_marker"
+        echo "error: simulated transient failure" >&2
+        exit 1
+      fi
+    fi
     if [ ! -d "$snap_dir" ]; then
       echo "error: no such snapshot $snapshot" >&2
       exit 1

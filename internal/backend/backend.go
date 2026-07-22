@@ -56,6 +56,23 @@ func (b *Backend) log() *slog.Logger {
 
 func lockKey(bucket, key string) string { return bucket + "\x00" + key }
 
+// groupLockKey serializes PBS.Backup calls that target the same PBS backup
+// group (server), independent of which S3 key each individual backup uses.
+// Two different backups for the same server share one group but have
+// different (bucket,key) locks, so without this a concurrent backup-time
+// collision between them could — in the worst case — have both sides'
+// collision-retry loops (see pbs.Client.Backup) repeatedly bump into each
+// other and both exhaust their retries. Serializing the actual PBS.Backup
+// invocation per group removes the race outright: at most one Backup call
+// for a given group is ever in flight, so a collision can only ever be
+// against already-committed history, never a moving target. Prefixed to
+// keep this key space disjoint from lockKey's (bucket,key) space, since
+// namespace/backup-type/backup-id strings could otherwise coincide with a
+// real bucket/key pair.
+func groupLockKey(namespace, backupType, backupID string) string {
+	return "group\x00" + namespace + "\x00" + backupType + "\x00" + backupID
+}
+
 var _ s3api.Backend = (*Backend)(nil)
 
 // mapNotFound converts the store's not-found sentinel into the one
@@ -79,7 +96,17 @@ func newUploadID() string {
 func (b *Backend) commitObject(ctx context.Context, bucket, key, filePath string, size int64, md5Hex string) (s3api.ObjectInfo, error) {
 	unlock := b.Locks.Lock(lockKey(bucket, key))
 	defer unlock()
+	return b.commitObjectLocked(ctx, bucket, key, filePath, size, md5Hex)
+}
 
+// commitObjectLocked is commitObject's body, factored out so
+// CompleteMultipartUpload — which must hold the (bucket,key) lock for its
+// own ConcatParts phase too, not just this final commit step — can call it
+// directly without acquiring the lock a second time. KeyedMutex.Lock is not
+// reentrant: a second Lock call for the same key from the same goroutine
+// would deadlock against itself. Every caller of this function must already
+// hold lockKey(bucket, key).
+func (b *Backend) commitObjectLocked(ctx context.Context, bucket, key, filePath string, size int64, md5Hex string) (s3api.ObjectInfo, error) {
 	// Namespaces are NOT created by the bridge (that requires
 	// Datastore.Modify, which the bridge's PBS user/token intentionally
 	// does not have) — an administrator must pre-create the namespace for
@@ -93,7 +120,12 @@ func (b *Backend) commitObject(ctx context.Context, bucket, key, filePath string
 	backupID := idmap.GroupIDFromKey(key)
 	backupTime := time.Now().UTC()
 
+	// Serialize the actual PBS.Backup call (including its internal
+	// backup-time-collision retry loop) per group, not just per
+	// (bucket,key) — see groupLockKey's comment for why.
+	unlockGroup := b.Locks.Lock(groupLockKey(ns, b.BackupType, backupID))
 	usedTime, err := b.PBS.Backup(ctx, filePath, b.BackupType, backupID, backupTime, ns)
+	unlockGroup()
 	if err != nil {
 		return s3api.ObjectInfo{}, fmt.Errorf("backend: pbs backup failed: %w", err)
 	}
@@ -107,14 +139,20 @@ func (b *Backend) commitObject(ctx context.Context, bucket, key, filePath string
 	}
 
 	old, oldErr := b.Store.GetObjectMapping(bucket, key)
-	if oldErr == nil {
-		if err := b.PBS.Forget(ctx, old.PBSBackupType, old.PBSBackupID, time.Unix(old.PBSBackupTime, 0), old.Namespace); err != nil {
-			b.log().Error("backend: forgetting superseded snapshot failed (leaked snapshot)", "bucket", bucket, "key", key, "old_backup_id", old.PBSBackupID, "error", err)
-		}
-	} else if !errors.Is(oldErr, store.ErrNotFound) {
+	if oldErr != nil && !errors.Is(oldErr, store.ErrNotFound) {
 		return s3api.ObjectInfo{}, fmt.Errorf("backend: checking for existing mapping: %w", oldErr)
 	}
 
+	// Point the key at the new snapshot before touching the old one in PBS.
+	// If this write fails (bbolt error, crash, disk full), the old mapping
+	// is still untouched and still valid — worst case the new snapshot
+	// leaks in PBS (recoverable via its notes field, see
+	// docs/LIMITATIONS.md), which is the same tolerance already accepted
+	// below if Forget fails. Doing this the other way around (forget old,
+	// then write the new mapping) would risk the key pointing at a
+	// just-deleted snapshot if the mapping write failed afterwards —
+	// breaking the "key always has a valid backing snapshot" guarantee
+	// instead of merely leaking storage.
 	mapping := store.ObjectMapping{
 		Bucket:        bucket,
 		Key:           key,
@@ -128,6 +166,12 @@ func (b *Backend) commitObject(ctx context.Context, bucket, key, filePath string
 	}
 	if err := b.Store.PutObjectMapping(mapping); err != nil {
 		return s3api.ObjectInfo{}, fmt.Errorf("backend: persisting object mapping: %w", err)
+	}
+
+	if oldErr == nil {
+		if err := b.PBS.Forget(ctx, old.PBSBackupType, old.PBSBackupID, time.Unix(old.PBSBackupTime, 0), old.Namespace); err != nil {
+			b.log().Error("backend: forgetting superseded snapshot failed (leaked snapshot)", "bucket", bucket, "key", key, "old_backup_id", old.PBSBackupID, "error", err)
+		}
 	}
 
 	return s3api.ObjectInfo{Key: key, Size: size, ETag: md5Hex, LastModified: mapping.UpdatedAt}, nil
@@ -297,7 +341,24 @@ func indexOf(s, substr string) int {
 	return -1
 }
 
+// CreateMultipartUpload, UploadPart and AbortMultipartUpload all take the
+// (bucket,key) lock — the same one DeleteObject and commitObject use — for
+// their whole body, not just their metadata writes. DeleteObject on a
+// still-in-progress (never-completed) backup falls through to
+// abortMatchingUploads, which removes an upload's scratch directory and
+// bbolt record; without this lock, that removal could run concurrently with
+// an in-flight UploadPart's disk write to a file inside the very directory
+// being removed, or with a PutPart bbolt write registering a part against an
+// upload record that Abort/Delete just deleted. Locking the entire body
+// (including the disk write, not just the metadata calls) is what actually
+// closes that window — a shorter critical section around only the metadata
+// steps would still race against RemoveUploadDir's os.RemoveAll. In
+// practice this doesn't cost real throughput: Wings uploads a backup's parts
+// sequentially already, so this lock is very rarely contended.
 func (b *Backend) CreateMultipartUpload(ctx context.Context, bucket, key string) (string, error) {
+	unlock := b.Locks.Lock(lockKey(bucket, key))
+	defer unlock()
+
 	uploadID := newUploadID()
 	now := time.Now().UTC()
 	err := b.Store.CreateUpload(store.MultipartUpload{
@@ -315,6 +376,9 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, bucket, key string)
 }
 
 func (b *Backend) UploadPart(ctx context.Context, bucket, key, uploadID string, partNumber int, body io.Reader) (string, error) {
+	unlock := b.Locks.Lock(lockKey(bucket, key))
+	defer unlock()
+
 	if _, err := b.Store.GetUpload(uploadID); err != nil {
 		return "", mapNotFound(err)
 	}
@@ -360,7 +424,15 @@ func (b *Backend) ListParts(ctx context.Context, bucket, key, uploadID string) (
 	return parts, nil
 }
 
+// CompleteMultipartUpload holds the (bucket,key) lock for its entire body —
+// covering ConcatParts (see CreateMultipartUpload's comment for why) as well
+// as the final commit — and therefore calls commitObjectLocked directly
+// rather than commitObject, which would try to acquire the same lock a
+// second time and deadlock.
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts []s3api.Part) (s3api.ObjectInfo, error) {
+	unlock := b.Locks.Lock(lockKey(bucket, key))
+	defer unlock()
+
 	upload, err := b.Store.GetUpload(uploadID)
 	if err != nil {
 		return s3api.ObjectInfo{}, mapNotFound(err)
@@ -406,7 +478,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uplo
 		return s3api.ObjectInfo{}, err
 	}
 
-	info, err := b.commitObject(ctx, upload.Bucket, upload.Key, final.Path, final.Size, final.MD5)
+	info, err := b.commitObjectLocked(ctx, upload.Bucket, upload.Key, final.Path, final.Size, final.MD5)
 	if err != nil {
 		// Deliberately do NOT clean up here: Panel's AWS SDK client
 		// automatically retries a failed CompleteMultipartUpload with the
@@ -438,6 +510,9 @@ func (b *Backend) cleanupUpload(uploadID string) {
 }
 
 func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
+	unlock := b.Locks.Lock(lockKey(bucket, key))
+	defer unlock()
+
 	if _, err := b.Store.GetUpload(uploadID); err != nil {
 		return mapNotFound(err)
 	}

@@ -63,13 +63,29 @@ runs in this order, serialized per `(bucket, key)` via an in-process keyed
 mutex (`internal/store.KeyedMutex`):
 
 1. Create the **new** PBS snapshot.
-2. Forget the **old** snapshot (best-effort; a failure here is logged, not
+2. Update the bbolt mapping to point at the new snapshot.
+3. Forget the **old** snapshot (best-effort; a failure here is logged, not
    fatal — it just leaks an old snapshot rather than ever leaving the key
    pointing at nothing).
-3. Update the bbolt mapping to point at the new snapshot.
 
 This guarantees there's never a window where the key has no valid backing
-snapshot.
+snapshot. The mapping write (step 2) deliberately happens *before* the old
+snapshot is forgotten (step 3), not after: if it happened after and the
+mapping write then failed (bbolt error, crash, disk full), the key would be
+left pointing at a snapshot that had just been deleted, rather than merely
+leaking the new snapshot the way a failure in step 3 does.
+
+The `(bucket, key)` lock only prevents two operations on the *same* key from
+racing. Two different backups for the *same server* (same PBS backup group,
+different keys — a different backup UUID each) aren't covered by it, but
+step 1's `pbs.Client.Backup` call is additionally serialized per group via
+`groupLockKey`, independent of the per-key lock: without that, two
+concurrent backups for one server could each hit a backup-time collision
+against the other and, since both run their own collision-retry loop (see
+`pbs.Client.Backup`), in the worst case repeatedly bump into each other and
+both exhaust their retries. Serializing the actual PBS call per group means
+at most one is ever in flight for a given server, so a collision can only
+ever be against already-committed history.
 
 ## GetObject: streaming vs. restore-then-slice
 
@@ -103,6 +119,79 @@ parts into one file, and runs the same commit path as a single-shot
 (Panel calls this itself, instead of supplying its own part list, whenever
 Wings reports a completed backup without one). `AbortMultipartUpload` and
 the background GC both just remove the scratch directory and bbolt record.
+
+`CreateMultipartUpload`, `UploadPart`, `AbortMultipartUpload` and
+`CompleteMultipartUpload` all hold the same `(bucket, key)` lock as
+`DeleteObject`/`commitObject`, for their whole body — not just their bbolt
+writes. Panel's "delete backup" action on a still-in-progress backup issues
+`DeleteObject` directly (see `abortMatchingUploads`), and without this lock
+that could race a concurrent `UploadPart`: a part's disk write landing in a
+scratch directory that `AbortMultipartUpload`/`abortMatchingUploads` is
+concurrently `os.RemoveAll`-ing, or a `PutPart` bbolt write registering a
+part against an upload record that a concurrent abort/delete just removed.
+Locking the entire body (not just the metadata calls) is what actually
+closes the window — a lock held only around `GetUpload`/`PutPart` would
+still race the disk write in between. `CompleteMultipartUpload` holds the
+lock across `ConcatParts` too, then calls `commitObjectLocked` (not
+`commitObject`) for its final commit step, since `KeyedMutex.Lock` isn't
+reentrant and a second `Lock` call for the same key from the same call stack
+would deadlock.
+
+## Retrying transient PBS failures
+
+`internal/pbs.Client` retries a CLI invocation itself (short exponential
+backoff, `pbs.MaxTransientRetries` attempts total) when the failure looks
+like a temporary connectivity problem (`pbs.IsTransient` — connection
+refused/reset, timeouts, TLS handshake failures, etc.), as opposed to a
+permanent one (bad auth, missing namespace, malformed arguments). This is
+separate from two other retry-shaped things already in this codebase:
+
+- `Backup`'s own backup-time-collision loop, where each iteration is a
+  legitimate distinct attempt with a bumped timestamp, not a blind retry of
+  an identical call.
+- `CompleteMultipartUpload`'s reliance on Panel's own AWS SDK client
+  automatically retrying a failed call with the same upload ID — the backend
+  just has to make that retry succeed against already-staged data (see
+  "Multipart upload lifecycle" above). That safety net only covers the one
+  call Panel is known to retry; `Backup`, `Restore`/`RestoreStream` and
+  `Forget` have no such upstream retry to lean on, hence the retry living in
+  `pbs.Client` itself instead.
+
+`Backup`, `Restore` and `Forget` retry safely because repeating an identical
+invocation after a failed attempt has no harmful side effect (the source
+file is untouched until `Backup` succeeds; `Restore` truncates its output
+file on every invocation; `Forget` is already idempotent). `RestoreStream` is
+the delicate case: `s3api.handleGetObject` writes HTTP response headers as
+soon as `RestoreStream` returns, before reading anything, so a retry is only
+possible up to that point. `Client.startRestoreStream` peeks the subprocess's
+first chunk of output before returning — if the process fails before
+producing any bytes (the common shape for a connection-level failure), the
+peek sees the failure via `cmd.Wait()` instead of a partially-consumed
+stream, and that's still safe to retry; once a byte has been read, the
+stream is handed back immediately and Close() surfaces any later failure
+as-is (no more retries at that point).
+
+`Client.Timeout`, if set, bounds each of these calls as a single shared
+budget — every attempt plus every backoff wait between them, combined —
+rather than being handed out fresh to each attempt (which would let a
+persistently-failing call run up to `MaxTransientRetries × Timeout` instead
+of `Timeout`). For `Backup`/`Restore`/`Forget`/`UpdateNotes` this is
+straightforward: `runWithRetry` wraps the whole retry loop in one
+`context.WithTimeout`. `RestoreStream` needs a split instead: the budget may
+only bound the pre-first-byte phase (`startCtx` in `startRestoreStream`), not
+the subprocess itself — once a stream has been successfully started and
+handed back to the caller, it's read from `ctx` (the real, uncapped request
+context) for as long as the HTTP response takes, same as before this
+retry logic existed. Binding the returned stream to the retry budget would
+mean a large restore gets killed mid-transfer as soon as `Timeout` elapses,
+even though it was already succeeding.
+
+Every retry log line also carries the originating request's ID
+(`internal/logging.RequestIDFromContext`), the same one `internal/s3api`
+attaches to the request context and returns to the client — `internal/pbs`
+has no notion of an HTTP request of its own, so without this a retry logged
+deep inside a PBS CLI invocation couldn't be tied back to the Panel/Wings
+call that triggered it.
 
 ## Verified against the real PBS client
 

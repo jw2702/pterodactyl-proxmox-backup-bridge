@@ -1,24 +1,17 @@
 package s3api
 
 import (
-	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"net/http"
+
+	"github.com/pterodactyl-proxmox-backup-bridge/bridge/internal/logging"
 )
 
-type ctxKey int
-
-const requestIDKey ctxKey = iota
-
-func newRequestID() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
-}
-
+// withRequestID mints a request ID and stores it in the request's context
+// via internal/logging, so packages further down the call chain that have
+// no HTTP request of their own — like internal/pbs, when it logs a retry of
+// a PBS CLI invocation — can still tag their log lines with it.
 func withRequestID(r *http.Request) (*http.Request, string) {
-	id := newRequestID()
-	ctx := context.WithValue(r.Context(), requestIDKey, id)
+	id := logging.NewRequestID()
+	ctx := logging.WithRequestID(r.Context(), id)
 	return r.WithContext(ctx), id
 }

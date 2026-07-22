@@ -53,6 +53,28 @@ func IsAlreadyExists(err error) bool {
 	return stderrContainsAny(err, "already exists")
 }
 
+// IsTransient reports whether err looks like a temporary connectivity
+// problem talking to the PBS server (as opposed to a permanent failure like
+// bad auth, a missing namespace, or a malformed argument) — the kind of
+// failure that's worth an automatic retry rather than surfacing immediately.
+// "simulated transient failure" is the shape scripts/stub-proxmox-backup-client
+// emits under STUB_FORCE_*_FAIL_COUNT, so the test suite can exercise this
+// path without a real flaky network.
+func IsTransient(err error) bool {
+	return stderrContainsAny(err,
+		"simulated transient failure",
+		"connection refused",
+		"connection reset",
+		"broken pipe",
+		"timed out",
+		"timeout",
+		"could not connect",
+		"tls handshake",
+		"network is unreachable",
+		"temporarily unavailable",
+	)
+}
+
 func stderrContainsAny(err error, substrs ...string) bool {
 	var pe *PBSError
 	if !errors.As(err, &pe) {
