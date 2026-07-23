@@ -115,10 +115,20 @@ bridge directly.
 
 ### Docker (recommended)
 
+Prebuilt images are published to the GitHub Container Registry on every
+[release](https://github.com/jw2702/pterodactyl-proxmox-backup-bridge/releases)
+(`ghcr.io/jw2702/pterodactyl-proxmox-backup-bridge`), tagged with both the
+release version and `latest`.
+
 ```sh
 cp .env.example .env   # fill in BRIDGE_*, PBS_* values
-docker compose -f docker-compose.example.yml up -d --build
+cp docker-compose.example.yml docker-compose.yml
+docker compose up -d
 ```
+
+To build the image from source instead (e.g. for local development),
+uncomment `build: .` in `docker-compose.yml` in place of `image: ...`, then
+run `docker compose up -d --build`.
 
 ### Locally
 

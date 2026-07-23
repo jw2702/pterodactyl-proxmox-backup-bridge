@@ -1,7 +1,7 @@
 services:
   pbs-bridge:
-    build: .
-    # or, once published: image: ghcr.io/yourorg/pterodactyl-proxmox-backup-bridge:latest
+    image: ghcr.io/jw2702/pterodactyl-proxmox-backup-bridge:latest
+    # or, to build from source instead: build: .
     restart: unless-stopped
     env_file: .env
     ports:
