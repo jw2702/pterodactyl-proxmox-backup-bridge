@@ -97,11 +97,19 @@ func hashSuffix(key string) string {
 	return hex.EncodeToString(sum[:])[:hashSuffixLen]
 }
 
-// SanitizeNamespace converts an S3 bucket name into a valid PBS namespace
-// path component. S3 bucket names are already restricted to lowercase
-// alphanumerics, '.', and '-', so this is close to a no-op; '.' (valid in
-// bucket names but not typically desired in a single namespace path
-// component) is replaced with '-'.
+// SanitizeNamespace converts an S3 bucket name into a PBS namespace path.
+// S3 bucket names cannot contain '/', so '.' is used as the namespace
+// separator: bucket "paul.pterodo" maps to namespace "paul/pterodo", and
+// any number of levels can be expressed this way (PBS itself limits the
+// namespace depth to 7). Empty components (leading, trailing or repeated
+// dots) are dropped so the result is always a valid namespace path.
 func SanitizeNamespace(bucket string) string {
-	return strings.ReplaceAll(bucket, ".", "-")
+	parts := strings.Split(bucket, ".")
+	out := parts[:0]
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, "/")
 }

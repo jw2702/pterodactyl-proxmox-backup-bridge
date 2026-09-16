@@ -71,8 +71,34 @@ proxmox-backup-client namespace create --ns pterodactyl-backups --repository <us
 ```
 
 (or via the PBS web UI: Datastore -> your datastore -> Namespaces -> Create).
-Dots in the bucket name are replaced with dashes for the namespace name
-(e.g. bucket `my.backups` -> namespace `my-backups`).
+
+### Nested namespaces
+
+S3 bucket names cannot contain `/`, so dots in the bucket name act as the
+namespace separator. This lets a bucket point at an arbitrarily nested
+namespace (PBS allows up to 7 levels):
+
+| `AWS_BUCKET`          | PBS namespace         |
+|-----------------------|-----------------------|
+| `pterodactyl-backups` | `pterodactyl-backups` |
+| `paul.pterodo`        | `paul/pterodo`        |
+| `org.team.games.mc`   | `org/team/games/mc`   |
+
+Every level must exist before use, e.g. for `paul.pterodo`:
+
+```sh
+proxmox-backup-client namespace create --ns paul --repository <user>@<realm>@<host>:<datastore>
+proxmox-backup-client namespace create --ns paul/pterodo --repository <user>@<realm>@<host>:<datastore>
+```
+
+The datastore itself is selected via `PBS_REPOSITORY` in the bridge's
+`.env`; the namespace only comes from `AWS_BUCKET`.
+
+> **Upgrade note:** earlier versions mapped dots to dashes
+> (`my.backups` -> `my-backups`). Backups created before the upgrade keep
+> their recorded namespace and remain restorable/deletable, but new
+> backups for a dotted bucket now go to the nested namespace, which must
+> be created first.
 
 ### Minimum required PBS permissions
 
@@ -93,6 +119,19 @@ backup/restore/delete; it deliberately does **not** include
 `Datastore.Modify`, since the bridge never creates namespaces or otherwise
 modifies datastore structure itself. Do not grant `DatastoreAdmin` — it's
 broader than necessary.
+
+For a token that is only allowed to touch one (possibly nested) namespace,
+the ACL path includes the full namespace path, e.g. for `AWS_BUCKET=paul.pterodo`
+on datastore `datastore`:
+
+```sh
+proxmox-backup-manager acl update /datastore/datastore/paul/pterodo DatastorePowerUser --auth-id <user>@<realm>!<tokenname>
+```
+
+With privilege separation enabled for the API token, the token's own user
+needs the same privileges as well — a token can never have more than its
+user. Note that `Datastore.Backup` alone is not enough: deleting a backup
+(`forget`) requires `Datastore.Prune`, which `DatastorePowerUser` includes.
 
 ## Network / transport security
 
