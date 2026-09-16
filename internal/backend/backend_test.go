@@ -808,7 +808,7 @@ func TestNamespaceDerivedFromBucket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mapping.Namespace != "my-dotted-bucket" {
-		t.Fatalf("namespace = %q, want dots replaced with dashes", mapping.Namespace)
+	if mapping.Namespace != "my/dotted/bucket" {
+		t.Fatalf("namespace = %q, want dots mapped to nested namespace levels", mapping.Namespace)
 	}
 }

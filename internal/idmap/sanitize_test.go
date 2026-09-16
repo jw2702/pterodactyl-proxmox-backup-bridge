@@ -96,10 +96,16 @@ func TestGroupIDFromKey_NoPathSegmentFallsBackToWholeKey(t *testing.T) {
 }
 
 func TestSanitizeNamespace(t *testing.T) {
-	if got := SanitizeNamespace("my.bucket.name"); got != "my-bucket-name" {
-		t.Fatalf("got %q", got)
+	cases := map[string]string{
+		"plain-bucket":        "plain-bucket",
+		"paul.pterodo":        "paul/pterodo",
+		"a.b.c.d.e.f.g":       "a/b/c/d/e/f/g",
+		"my-org.team-1.games": "my-org/team-1/games",
+		".lead..double.":      "lead/double",
 	}
-	if got := SanitizeNamespace("plain-bucket"); got != "plain-bucket" {
-		t.Fatalf("got %q", got)
+	for in, want := range cases {
+		if got := SanitizeNamespace(in); got != want {
+			t.Errorf("SanitizeNamespace(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
